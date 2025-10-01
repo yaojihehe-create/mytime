@@ -3,13 +3,14 @@ import os
 import json
 import random
 import tempfile
-import base64 # <== Base64デコードを追加
+import base64
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from flask import Flask
 from threading import Thread
 from multiprocessing import current_process
 from datetime import datetime, timedelta, timezone
+import asyncio
 
 # Firebase/Firestore関連のインポート
 import firebase_admin
@@ -25,18 +26,50 @@ tz_jst = timezone(timedelta(hours=9)) # 日本時間 (JST)
 
 # Botクライアントの定義
 class StatusTrackerBot(commands.Bot):
-    # ... (この部分は変更なし) ...
+    # チャンネルIDの初期値はNoneとし、Firestoreからロードする
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.app_id = os.getenv("__app_id", "default-app-id")
         self.collection_path = f'artifacts/{self.app_id}/public/data/user_status'
+        # チャンネル設定を保存するコレクションパス
+        self.config_doc_ref = db.collection(f'artifacts/{self.app_id}/public/data/bot_config').document('settings')
+        self.report_channel_id = None # Bot起動時にFirestoreからロードされる
+
+    async def _load_config(self):
+        """FirestoreからレポートチャンネルIDをロードする"""
+        try:
+            doc = await asyncio.to_thread(self.config_doc_ref.get)
+            if doc.exists and 'report_channel_id' in doc.to_dict():
+                self.report_channel_id = doc.to_dict()['report_channel_id']
+                print(f"FirestoreからレポートチャンネルIDをロード: {self.report_channel_id}")
+                return True
+            else:
+                print("FirestoreにレポートチャンネルIDが見つかりませんでした。")
+                return False
+        except Exception as e:
+            print(f"設定ロード中にエラーが発生しました: {e}")
+            return False
+
+    async def _save_config(self, channel_id: int):
+        """FirestoreにレポートチャンネルIDを保存する"""
+        try:
+            await asyncio.to_thread(self.config_doc_ref.set, 
+                                    {'report_channel_id': channel_id}, 
+                                    merge=True)
+            self.report_channel_id = channel_id
+            return True
+        except Exception as e:
+            print(f"設定保存中にエラーが発生しました: {e}")
+            return False
 
     async def on_ready(self):
         print('---------------------------------')
         print(f'Botがログインしました: {self.user.name}')
         print('Botはサーバーのユーザー活動時間を記録します。')
-        print('---------------------------------')
         
+        # 1. 設定のロード
+        await self._load_config()
+
         try:
             for guild in self.guilds:
                 self.tree.copy_global_to(guild=guild)
@@ -51,6 +84,15 @@ class StatusTrackerBot(commands.Bot):
                 if member.id != self.user.id:
                     status_key = str(member.status)
                     last_status_updates[member.id] = (status_key, now)
+
+        # 2. ロードされたIDに基づいてタスクを開始
+        if self.report_channel_id is not None:
+            self.daily_report.start()
+            print(f"日次レポートタスクを開始しました。送信先: {self.report_channel_id}")
+        else:
+            print("レポートチャンネルIDが未設定のため、自動送信をスキップします。/set_report_channelで設定してください。")
+            
+        print('---------------------------------')
 
     async def on_presence_update(self, before, after):
         if after.id == self.user.id or db is None:
@@ -82,9 +124,72 @@ class StatusTrackerBot(commands.Bot):
             }, merge=True)
 
         last_status_updates[user_id] = (current_status_key, now)
+        
+    # ----------------------------------------------------
+    # 📌 日次レポートタスク (毎日 JST 00:00 実行)
+    # ----------------------------------------------------
+    @tasks.loop(time=datetime.time(0, 0, tzinfo=tz_jst)) 
+    async def daily_report(self):
+        # 毎回の実行前に最新のIDをロード (念のため)
+        await self._load_config() 
+        
+        if not self.is_ready() or db is None or self.report_channel_id is None:
+            print("自動レポートがスキップされました。Botの準備ができていないか、チャンネルIDが未設定です。")
+            return
+
+        report_channel = self.get_channel(self.report_channel_id)
+        if not report_channel:
+            print(f"チャンネルID {self.report_channel_id} が見つからないか、アクセスできません。")
+            return
+
+        print("--- 日次レポート処理開始 (JST 00:00) ---")
+
+        for guild in self.guilds:
+            days = 1 # 前日分のレポート
+            
+            # 全メンバーのレポートを生成し、チャンネルに送信
+            for member in guild.members:
+                if member.bot:
+                    continue
+                
+                user_data = await get_user_report_data(member, db, self.collection_path, days=days)
+                
+                # 活動記録が見つからなかった、または合計時間が0の場合はスキップ
+                if not user_data or user_data.get('total', 0) == 0:
+                    continue
+
+                # レポートEmbedの作成 (send_user_report_embedから流用)
+                online_time = user_data.get('online_time_s', 0)
+                offline_time = user_data.get('offline_time_s', 0)
+                total_sec = online_time + offline_time
+                
+                total_formatted = format_time(total_sec)
+                online_formatted = format_time(online_time)
+                
+                embed = discord.Embed(
+                    title=f"📅 {member.display_name} さんの日次レポート",
+                    description=f"集計期間: **昨日（1日間）**\n📊 **合計活動時間: {total_formatted}**",
+                    color=member.color if member.color != discord.Color.default() else discord.Color.blue()
+                )
+                embed.set_thumbnail(url=member.display_avatar.url)
+
+                embed.add_field(name="💻 オンライン活動時間", value=online_formatted, inline=True)
+                embed.add_field(name="💤 オフライン時間", value=format_time(offline_time), inline=True)
+                
+                embed.set_footer(text=f"レポート生成時刻: {datetime.now(tz_jst).strftime('%Y/%m/%d %H:%M:%S JST')}")
+
+                await report_channel.send(embed=embed)
+                await asyncio.sleep(0.5) # APIレート制限対策
+        
+        print("--- 日次レポート処理完了 ---")
+        
+    @daily_report.before_loop
+    async def before_daily_report(self):
+        await self.wait_until_ready()
+
 
 # -----------------
-# レポート表示用のヘルパー関数 (更新箇所)
+# レポート表示用のヘルパー関数 (変更なし)
 # -----------------
 def format_time(seconds: float) -> str:
     """秒数（float）を HH時間 MM分 SS秒 の形式にフォーマットする (ミリ秒表示対応)"""
@@ -230,14 +335,13 @@ async def send_user_report_embed(interaction: discord.Interaction, member: disco
 
 
 # -----------------
-# Firestore初期化関数 (Base64デコードと一時ファイル処理)
+# Firestore初期化関数 (変更なし)
 # -----------------
 def init_firestore():
     global db
     if db is not None:
         return db
 
-    # Base64エンコードされた設定文字列を環境変数から取得
     base64_config = os.getenv("__firebase_config")
     
     if not base64_config:
@@ -246,19 +350,14 @@ def init_firestore():
 
     temp_file_path = None
     try:
-        # 1. Base64文字列をデコードし、JSONバイトデータを取得
         json_bytes = base64.b64decode(base64_config)
         json_str = json_bytes.decode('utf-8')
         
-        # 2. 一時ファイルを作成し、デコードしたJSONを書き込む
         with tempfile.NamedTemporaryFile(mode='w', delete=False, encoding='utf-8') as temp_file:
             temp_file.write(json_str)
             temp_file_path = temp_file.name
 
-        # 3. 認証を実行: credentials.Certificate() に一時ファイルのパスを渡す
         cred = credentials.Certificate(temp_file_path)
-        
-        # 4. Firebaseアプリを初期化
         firebase_admin.initialize_app(cred)
         
         db = firestore.client()
@@ -267,18 +366,16 @@ def init_firestore():
         
     except Exception as e:
         print(f"Firestore初期化に失敗しました。認証情報（__firebase_config）を確認してください: {e}")
-        # Base64デコードやJSON解析エラーの詳細を追記
         print("エラー詳細: Base64エンコードされたJSON文字列が不完全、または不正な可能性があります。")
         return None
     
     finally:
-        # 5. 認証後、一時ファイルを削除
         if temp_file_path and os.path.exists(temp_file_path):
              os.remove(temp_file_path)
 
 
 # -----------------
-# Discord Bot本体の起動関数 (変更なし)
+# Discord Bot本体の起動関数
 # -----------------
 def run_discord_bot():
     if current_process().name != 'MainProcess':
@@ -296,49 +393,71 @@ def run_discord_bot():
     intents.presences = True
     intents.message_content = True
 
+    # チャンネルIDのハードコードを削除し、Botインスタンスを生成
     bot = StatusTrackerBot(command_prefix='!', intents=intents)
 
-    # ====================================================================
-    # 📌 チャンネルIDの設定場所
-    # 
-    # 自動レポートなどを送りたいチャンネルのIDをここに設定してください。
-    # ここでは例として None に設定していますが、実際のIDに置き換えてください。
-    REPORT_CHANNEL_ID = "1422893472599248977"
-    # REPORT_CHANNEL_ID = os.getenv("REPORT_CHANNEL_ID", None) # 環境変数から取得する場合
-    # REPORT_CHANNEL_ID = 123456789012345678 # ハードコードする場合
-    # ====================================================================
+    @bot.tree.command(name="set_report_channel", description="日次レポートの送信先チャンネルを設定します。")
+    @app_commands.describe(channel='レポートを送信するテキストチャンネル')
+    async def set_report_channel_command(interaction: discord.Interaction, channel: discord.TextChannel):
+        await interaction.response.defer(ephemeral=True)
+        
+        channel_id = channel.id
+        
+        # FirestoreにチャンネルIDを保存
+        if await bot._save_config(channel_id):
+            
+            # 定期実行タスクが既に実行されているかチェックし、停止・再開
+            if bot.daily_report.is_running():
+                bot.daily_report.stop()
+                await asyncio.sleep(1) # タスク停止を待機
+            
+            bot.daily_report.start()
+            
+            await interaction.followup.send(f"✅ レポート送信先が **{channel.mention}** に設定されました。\n毎日 JST 0:00 に全メンバーのレポートを送信します。", ephemeral=True)
+        else:
+            await interaction.followup.send("❌ 設定の保存に失敗しました。", ephemeral=True)
 
-    @bot.tree.command(name="mytime", description="指定したユーザーの過去7日間のオンライン時間をレポートします。")
-    @app_commands.describe(member='活動時間を知りたいサーバーメンバー')
-    async def mytime_command(interaction: discord.Interaction, member: discord.Member):
+    @bot.tree.command(name="mytime", description="指定した期間の活動時間レポートを表示します。")
+    @app_commands.choices(period=[
+        app_commands.Choice(name="1日 (昨日)", value=1),
+        app_commands.Choice(name="3日間", value=3)
+    ])
+    @app_commands.describe(period='集計する期間', member='活動時間を知りたいサーバーメンバー (省略可能)')
+    async def mytime_command(interaction: discord.Interaction, period: app_commands.Choice[int], member: discord.Member = None):
         await interaction.response.defer()
         
-        user_data = await get_user_report_data(member, db, bot.collection_path, days=7)
+        # メンバーが指定されなかった場合はコマンド実行者自身を対象とする
+        target_member = member if member is not None else interaction.user
+
+        days = period.value # 選択された期間 (1 または 3)
         
-        await send_user_report_embed(interaction, member, user_data, 7)
+        user_data = await get_user_report_data(target_member, db, bot.collection_path, days=days)
+        
+        await send_user_report_embed(interaction, target_member, user_data, days)
     
     # チャンネルIDの使用例を示すテストコマンド
     @bot.tree.command(name="send_report_test", description="設定されたチャンネルへテストレポートを送信します。")
     async def send_report_test_command(interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
-        if REPORT_CHANNEL_ID is None:
-            await interaction.followup.send("⚠️ レポート送信先チャンネルIDが設定されていません。", ephemeral=True)
+        channel_id = bot.report_channel_id 
+        
+        if channel_id is None:
+            await interaction.followup.send("⚠️ レポート送信先チャンネルIDが設定されていません。\n`/set_report_channel` コマンドで設定してください。", ephemeral=True)
             return
 
         try:
-            # チャンネルID (文字列) を整数に変換してチャンネルオブジェクトを取得
-            channel = bot.get_channel(int(REPORT_CHANNEL_ID)) 
+            channel = bot.get_channel(channel_id) 
             if channel:
                 test_embed = discord.Embed(
                     title="📝 テストレポート",
-                    description="これは設定されたチャンネルへのテスト送信です。\nこの機能が今後、日次レポートなどに使用されます。",
+                    description="これは設定されたチャンネルへのテスト送信です。\n✅ 自動レポートは**毎日 JST 0:00** に送信されます。",
                     color=discord.Color.green()
                 )
                 await channel.send(embed=test_embed)
-                await interaction.followup.send(f"✅ テストレポートをチャンネルID: `{REPORT_CHANNEL_ID}` のチャンネルに送信しました。", ephemeral=True)
+                await interaction.followup.send(f"✅ テストレポートをチャンネル: {channel.mention} に送信しました。", ephemeral=True)
             else:
-                await interaction.followup.send(f"❌ チャンネルID `{REPORT_CHANNEL_ID}` が見つからないか、Botにアクセス権限がありません。", ephemeral=True)
+                await interaction.followup.send(f"❌ チャンネルID `{channel_id}` が見つからないか、Botにアクセス権限がありません。", ephemeral=True)
         except Exception as e:
             print(f"レポート送信エラー: {e}")
             await interaction.followup.send("エラーが発生しました。", ephemeral=True)
