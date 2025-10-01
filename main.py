@@ -298,6 +298,16 @@ def run_discord_bot():
 
     bot = StatusTrackerBot(command_prefix='!', intents=intents)
 
+    # ====================================================================
+    # 📌 チャンネルIDの設定場所
+    # 
+    # 自動レポートなどを送りたいチャンネルのIDをここに設定してください。
+    # ここでは例として None に設定していますが、実際のIDに置き換えてください。
+    REPORT_CHANNEL_ID = "1422893472599248977"
+    # REPORT_CHANNEL_ID = os.getenv("REPORT_CHANNEL_ID", None) # 環境変数から取得する場合
+    # REPORT_CHANNEL_ID = 123456789012345678 # ハードコードする場合
+    # ====================================================================
+
     @bot.tree.command(name="mytime", description="指定したユーザーの過去7日間のオンライン時間をレポートします。")
     @app_commands.describe(member='活動時間を知りたいサーバーメンバー')
     async def mytime_command(interaction: discord.Interaction, member: discord.Member):
@@ -307,6 +317,33 @@ def run_discord_bot():
         
         await send_user_report_embed(interaction, member, user_data, 7)
     
+    # チャンネルIDの使用例を示すテストコマンド
+    @bot.tree.command(name="send_report_test", description="設定されたチャンネルへテストレポートを送信します。")
+    async def send_report_test_command(interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        if REPORT_CHANNEL_ID is None:
+            await interaction.followup.send("⚠️ レポート送信先チャンネルIDが設定されていません。", ephemeral=True)
+            return
+
+        try:
+            # チャンネルID (文字列) を整数に変換してチャンネルオブジェクトを取得
+            channel = bot.get_channel(int(REPORT_CHANNEL_ID)) 
+            if channel:
+                test_embed = discord.Embed(
+                    title="📝 テストレポート",
+                    description="これは設定されたチャンネルへのテスト送信です。\nこの機能が今後、日次レポートなどに使用されます。",
+                    color=discord.Color.green()
+                )
+                await channel.send(embed=test_embed)
+                await interaction.followup.send(f"✅ テストレポートをチャンネルID: `{REPORT_CHANNEL_ID}` のチャンネルに送信しました。", ephemeral=True)
+            else:
+                await interaction.followup.send(f"❌ チャンネルID `{REPORT_CHANNEL_ID}` が見つからないか、Botにアクセス権限がありません。", ephemeral=True)
+        except Exception as e:
+            print(f"レポート送信エラー: {e}")
+            await interaction.followup.send("エラーが発生しました。", ephemeral=True)
+
+
     if TOKEN:
         try:
             bot.run(TOKEN)
