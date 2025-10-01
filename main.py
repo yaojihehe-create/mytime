@@ -2,6 +2,7 @@ import discord
 import os
 import json
 import random
+import tempfile
 import io # 新しくインポートを追加
 from discord import app_commands
 from discord.ext import commands
@@ -94,41 +95,49 @@ class StatusTrackerBot(commands.Bot):
         last_status_updates[user_id] = (current_status_key, now)
 
 # -----------------
-# Firestore初期化関数
+# Firestore初期化関数 (Render環境変数をファイルとして処理する)
 # -----------------
 def init_firestore():
     global db
     if db is not None:
         return db
 
-    # Render環境変数からFirebase設定をロード
     firebase_config_str = os.getenv("__firebase_config")
     
     if not firebase_config_str:
         print("致命的エラー: __firebase_config 環境変数が設定されていません。")
         return None
 
+    # 一時ファイルを使って認証を強制実行
+    temp_file_path = None
     try:
-        # JSON文字列をメモリ上のファイルのように扱います (io.StringIOを使用)
-        # これにより、環境変数設定時の予期しない改行やエンコードの問題を回避し、
-        # credentials.Certificate() が要求する形式で情報を渡します。
+        # 1. JSON文字列をクリーンアップ
+        cleaned_json_str = firebase_config_str.strip().strip('\'"')
         
-        # 重要なステップ: JSON文字列を読み込み、認証情報として直接使用
-        cred = credentials.Certificate(io.StringIO(firebase_config_str))
+        # 2. 一時ファイルを作成し、ファイルパスを取得 (Renderの要求に対応)
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, encoding='utf-8') as temp_file:
+            temp_file.write(cleaned_json_str)
+            temp_file_path = temp_file.name
+
+        # 3. 認証を実行: credentials.Certificate() に一時ファイルのパスを渡す
+        cred = credentials.Certificate(temp_file_path)
         
-        # Firebaseアプリを初期化
+        # 4. Firebaseアプリを初期化
         firebase_admin.initialize_app(cred)
         
         db = firestore.client()
         print("Firestore接続完了。")
         return db
+        
     except Exception as e:
-        # 認証情報が間違っている、またはJSON文字列に問題がある場合のエラーログ
         print(f"Firestore初期化に失敗しました。認証情報（__firebase_config）を確認してください: {e}")
         return None
-
-# ... その他のコードはそのまま ...
-
+    
+    finally:
+        # 5. 認証後、一時ファイルを削除
+        if temp_file_path and os.path.exists(temp_file_path):
+             os.remove(temp_file_path)
+            
 # -----------------
 # レポート生成ヘルパー関数
 # -----------------
