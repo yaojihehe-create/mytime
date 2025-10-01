@@ -9,7 +9,8 @@ from discord.ext import commands, tasks
 from flask import Flask
 from threading import Thread
 from multiprocessing import current_process
-from datetime import datetime, timedelta, timezone
+# datetimeモジュールからtimeクラスを明示的にインポート
+from datetime import datetime, timedelta, timezone, time 
 import asyncio
 
 # Firebase/Firestore関連のインポート
@@ -128,7 +129,8 @@ class StatusTrackerBot(commands.Bot):
     # ----------------------------------------------------
     # 📌 日次レポートタスク (毎日 JST 00:00 実行)
     # ----------------------------------------------------
-    @tasks.loop(time=datetime.time(0, 0, tzinfo=tz_jst)) 
+    # time=time(...) に修正
+    @tasks.loop(time=time(0, 0, tzinfo=tz_jst)) 
     async def daily_report(self):
         # 毎回の実行前に最新のIDをロード (念のため)
         await self._load_config() 
