@@ -39,6 +39,7 @@ class StatusTrackerBot(commands.Bot):
     async def _load_config(self):
         """FirestoreからレポートチャンネルIDをロードする"""
         try:
+            # Firestoreの処理はIOバウンドなのでto_threadを使用
             doc = await asyncio.to_thread(self.config_doc_ref.get)
             if doc.exists and 'report_channel_id' in doc.to_dict():
                 self.report_channel_id = doc.to_dict()['report_channel_id']
@@ -54,6 +55,7 @@ class StatusTrackerBot(commands.Bot):
     async def _save_config(self, channel_id: int):
         """FirestoreにレポートチャンネルIDを保存する"""
         try:
+            # Firestoreの処理はIOバウンドなのでto_threadを使用
             await asyncio.to_thread(self.config_doc_ref.set, 
                                     {'report_channel_id': channel_id}, 
                                     merge=True)
@@ -72,10 +74,11 @@ class StatusTrackerBot(commands.Bot):
         await self._load_config()
 
         try:
-            for guild in self.guilds:
-                self.tree.copy_global_to(guild=guild)
-                await self.tree.sync(guild=guild)
-            print("スラッシュコマンド同期完了。")
+            # 📌 修正: グローバル同期を強制実行します。
+            # この処理が完了すると、Bot参加済みの全てのサーバーにコマンドが反映されますが、
+            # Discord側のキャッシュにより反映まで数分かかる場合があります。
+            await self.tree.sync() 
+            print("グローバルスラッシュコマンド同期完了。")
         except Exception as e:
             print(f"スラッシュコマンド同期エラー: {e}")
             
@@ -94,6 +97,17 @@ class StatusTrackerBot(commands.Bot):
             print("レポートチャンネルIDが未設定のため、自動送信をスキップします。/set_report_channelで設定してください。")
             
         print('---------------------------------')
+
+    async def on_guild_join(self, guild: discord.Guild):
+        """新しいサーバーに参加した際、即座にスラッシュコマンドを同期する (念のため残しますが、on_readyのグローバル同期で対応します)"""
+        try:
+            print(f"新しいサーバーに参加しました: {guild.name} ({guild.id})。コマンドを同期します...")
+            # グローバル同期のキャッシュ期間を回避するため、参加したギルドに対してコピー＆同期を行います
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+            print(f"サーバー {guild.name} へのスラッシュコマンド同期が完了しました。")
+        except Exception as e:
+            print(f"新しいサーバーへのスラッシュコマンド同期エラー: {e}")
 
     async def on_presence_update(self, before, after):
         if after.id == self.user.id or db is None:
