@@ -100,20 +100,31 @@ def init_firestore():
     if db is not None:
         return db
 
+    # Render環境変数からFirebase設定をロード
     firebase_config_str = os.getenv("__firebase_config")
+    
     if not firebase_config_str:
         print("致命的エラー: __firebase_config 環境変数が設定されていません。")
         return None
 
     try:
+        # JSON文字列を辞書オブジェクトに変換 (例: {"type": "service_account", ...})
         cred_dict = json.loads(firebase_config_str)
+        
+        # サービスアカウント認証情報を初期化
+        # credentials.Certificate() には、ファイルパスではなく、
+        # 変換された辞書オブジェクトを直接渡すのが正しい方法です。
         cred = credentials.Certificate(cred_dict)
+        
+        # Firebaseアプリを初期化
         firebase_admin.initialize_app(cred)
+        
         db = firestore.client()
         print("Firestore接続完了。")
         return db
     except Exception as e:
-        print(f"Firestore初期化エラー: {e}")
+        # 修正：エラー時にJSONの先頭を誤ってファイルパスとして表示させないようにする
+        print(f"Firestore初期化エラー: JSONの読み込みまたはFirebaseの初期化に失敗しました。{e}")
         return None
 
 # -----------------
