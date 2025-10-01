@@ -2,7 +2,7 @@ import discord
 import os
 import json
 import random
-import tempfile 
+import tempfile
 import base64 # <== Base64デコードを追加
 from discord import app_commands
 from discord.ext import commands
@@ -44,7 +44,7 @@ class StatusTrackerBot(commands.Bot):
             print("スラッシュコマンド同期完了。")
         except Exception as e:
             print(f"スラッシュコマンド同期エラー: {e}")
-        
+            
         now = datetime.now(tz_jst)
         for guild in self.guilds:
             for member in guild.members:
@@ -84,14 +84,34 @@ class StatusTrackerBot(commands.Bot):
         last_status_updates[user_id] = (current_status_key, now)
 
 # -----------------
-# レポート表示用のヘルパー関数 (変更なし)
+# レポート表示用のヘルパー関数 (更新箇所)
 # -----------------
-def format_time(seconds):
-    if seconds < 0: seconds = 0
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    return f"{h:02}時間 {m:02}分 {s:02}秒"
+def format_time(seconds: float) -> str:
+    """秒数（float）を HH時間 MM分 SS秒 の形式にフォーマットする (ミリ秒表示対応)"""
+    if seconds < 0:
+        return f"({format_time(abs(seconds))})"
+        
+    total_seconds_int = int(seconds)
+    
+    hours, remainder = divmod(total_seconds_int, 3600)
+    minutes, seconds_int = divmod(remainder, 60)
+    
+    # 小数点以下の秒数を取得
+    milliseconds = seconds - total_seconds_int
+    
+    parts = []
+    if hours > 0:
+        parts.append(f"{hours}時間")
+    if minutes > 0:
+        parts.append(f"{minutes}分")
+    
+    # 秒数とミリ秒を表示
+    if seconds_int > 0 or milliseconds > 0 or not parts:
+        # 秒（整数部） + 小数点以下2桁まで
+        formatted_seconds = f"{seconds_int + milliseconds:.2f}秒"
+        parts.append(formatted_seconds)
+        
+    return " ".join(parts)
 
 def get_status_emoji(status):
     if status == 'online': return '🟢 オンライン'
@@ -112,6 +132,8 @@ async def get_user_report_data(member: discord.Member, db, collection_path, days
     statuses = ['online', 'idle', 'dnd', 'offline']
     
     total_sec = 0
+    online_sec = 0
+    offline_sec = 0
     user_data = {}
 
     for status in statuses:
@@ -123,27 +145,66 @@ async def get_user_report_data(member: discord.Member, db, collection_path, days
         
         user_data[status] = status_total_sec
         total_sec += status_total_sec
+        
+        # オンライン/オフライン時間の集計
+        if status in ['online', 'idle', 'dnd']:
+            online_sec += status_total_sec
+        elif status == 'offline':
+            offline_sec += status_total_sec
+
 
     user_data['total'] = total_sec
+    user_data['online_time_s'] = online_sec
+    user_data['offline_time_s'] = offline_sec
+    
     return user_data
 
 async def send_user_report_embed(interaction: discord.Interaction, member: discord.Member, user_data: dict, days: int):
-    if not user_data or user_data['total'] == 0:
+    
+    # 活動時間の集計
+    online_time = user_data.get('online_time_s', 0)
+    offline_time = user_data.get('offline_time_s', 0)
+    total_sec = online_time + offline_time
+    
+    if total_sec == 0:
         await interaction.followup.send(f"⚠️ **{member.display_name}** さんの過去 {days} 日間の活動記録は見つかりませんでした。")
         return
 
-    total_sec = user_data['total']
+    # フォーマットされた時間
     total_formatted = format_time(total_sec)
+    online_formatted = format_time(online_time)
+    offline_formatted = format_time(offline_time)
     
     embed = discord.Embed(
         title=f"⏳ {member.display_name} さんの活動時間レポート",
-        description=f"集計期間: 過去 **{days}** 日間（合計: **{total_formatted}**）",
+        description=f"集計期間: 過去 **{days}** 日間",
         color=member.color if member.color != discord.Color.default() else discord.Color.blue()
     )
     
     embed.set_thumbnail(url=member.display_avatar.url)
-    embed.set_footer(text=f"レポート生成時刻: {datetime.now(tz_jst).strftime('%Y/%m/%d %H:%M:%S JST')}")
 
+    # 1. 合計活動時間 (一番上に目立つように)
+    embed.add_field(
+        name="📊 合計活動時間",
+        value=f"**{total_formatted}**",
+        inline=False 
+    )
+    
+    # 2. オンライン活動時間 (online, idle, dnd の合計)
+    embed.add_field(
+        name="💻 オンライン活動時間",
+        value=f"**{online_formatted}**",
+        inline=True
+    )
+    
+    # 3. オフライン時間 (offline)
+    embed.add_field(
+        name="💤 オフライン時間",
+        value=f"{offline_formatted}",
+        inline=True
+    )
+    
+    # 4. ステータス別 内訳 (詳細)
     statuses = ['online', 'idle', 'dnd', 'offline']
     status_field_value = []
     
@@ -159,11 +220,12 @@ async def send_user_report_embed(interaction: discord.Interaction, member: disco
         )
 
     embed.add_field(
-        name="📊 ステータス別 内訳",
+        name="📌 ステータス詳細内訳",
         value="\n".join(status_field_value),
         inline=False
     )
     
+    embed.set_footer(text=f"レポート生成時刻: {datetime.now(tz_jst).strftime('%Y/%m/%d %H:%M:%S JST')}")
     await interaction.followup.send(embed=embed)
 
 
@@ -227,12 +289,12 @@ def run_discord_bot():
         print("Botはデータベース接続なしで起動できません。")
         return
 
-    TOKEN = os.getenv("DISCORD_TOKEN") 
+    TOKEN = os.getenv("DISCORD_TOKEN")
     
     intents = discord.Intents.default()
-    intents.members = True 
-    intents.presences = True 
-    intents.message_content = True 
+    intents.members = True
+    intents.presences = True
+    intents.message_content = True
 
     bot = StatusTrackerBot(command_prefix='!', intents=intents)
 
