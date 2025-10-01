@@ -2,8 +2,8 @@ import discord
 import os
 import json
 import random
-import tempfile
-import io # 新しくインポートを追加
+import tempfile 
+import base64 # <== Base64デコードを追加
 from discord import app_commands
 from discord.ext import commands
 from flask import Flask
@@ -25,10 +25,10 @@ tz_jst = timezone(timedelta(hours=9)) # 日本時間 (JST)
 
 # Botクライアントの定義
 class StatusTrackerBot(commands.Bot):
+    # ... (この部分は変更なし) ...
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.app_id = os.getenv("__app_id", "default-app-id")
-        # Public Data (共有データ) として保存
         self.collection_path = f'artifacts/{self.app_id}/public/data/user_status'
 
     async def on_ready(self):
@@ -37,9 +37,7 @@ class StatusTrackerBot(commands.Bot):
         print('Botはサーバーのユーザー活動時間を記録します。')
         print('---------------------------------')
         
-        # スラッシュコマンドの同期
         try:
-            # Botが参加している全てのギルド(サーバー)にコマンドを同期
             for guild in self.guilds:
                 self.tree.copy_global_to(guild=guild)
                 await self.tree.sync(guild=guild)
@@ -47,7 +45,6 @@ class StatusTrackerBot(commands.Bot):
         except Exception as e:
             print(f"スラッシュコマンド同期エラー: {e}")
         
-        # 起動時のステータス初期記録
         now = datetime.now(tz_jst)
         for guild in self.guilds:
             for member in guild.members:
@@ -73,73 +70,21 @@ class StatusTrackerBot(commands.Bot):
         if current_status_key == prev_status_key:
             return
 
-        # 時間差を計算し、データベースに記録
         duration = (now - prev_time).total_seconds()
-        
-        # 記録するフィールド名 (例: 'online_seconds', 'idle_seconds')
         field_name = f'{prev_status_key}_seconds'
-        
-        # 日付フィールド (例: '2025-10-01_online_seconds')
         date_field_name = f'{now.strftime("%Y-%m-%d")}_{field_name}'
 
-        # Firestoreにアトミックな加算操作で時間を記録
         if duration > 0:
             doc_ref.set({
                 field_name: firestore.Increment(duration),
                 date_field_name: firestore.Increment(duration),
                 'last_updated': now
             }, merge=True)
-            # print(f"記録: {after.display_name} | {prev_status_key}で {duration:.2f}秒") # ログが多い場合はコメントアウト推奨
 
-        # 状態を更新
         last_status_updates[user_id] = (current_status_key, now)
 
 # -----------------
-# Firestore初期化関数 (Render環境変数をファイルとして処理する)
-# -----------------
-def init_firestore():
-    global db
-    if db is not None:
-        return db
-
-    firebase_config_str = os.getenv("__firebase_config")
-    
-    if not firebase_config_str:
-        print("致命的エラー: __firebase_config 環境変数が設定されていません。")
-        return None
-
-    # 一時ファイルを使って認証を強制実行
-    temp_file_path = None
-    try:
-        # 1. JSON文字列をクリーンアップ
-        cleaned_json_str = firebase_config_str.strip().strip('\'"')
-        
-        # 2. 一時ファイルを作成し、ファイルパスを取得 (Renderの要求に対応)
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, encoding='utf-8') as temp_file:
-            temp_file.write(cleaned_json_str)
-            temp_file_path = temp_file.name
-
-        # 3. 認証を実行: credentials.Certificate() に一時ファイルのパスを渡す
-        cred = credentials.Certificate(temp_file_path)
-        
-        # 4. Firebaseアプリを初期化
-        firebase_admin.initialize_app(cred)
-        
-        db = firestore.client()
-        print("Firestore接続完了。")
-        return db
-        
-    except Exception as e:
-        print(f"Firestore初期化に失敗しました。認証情報（__firebase_config）を確認してください: {e}")
-        return None
-    
-    finally:
-        # 5. 認証後、一時ファイルを削除
-        if temp_file_path and os.path.exists(temp_file_path):
-             os.remove(temp_file_path)
-            
-# -----------------
-# レポート生成ヘルパー関数
+# レポート表示用のヘルパー関数 (変更なし)
 # -----------------
 def format_time(seconds):
     if seconds < 0: seconds = 0
@@ -156,7 +101,6 @@ def get_status_emoji(status):
     return status.capitalize()
 
 async def get_user_report_data(member: discord.Member, db, collection_path, days=7):
-    # ユーザーデータをFirestoreから取得
     doc_ref = db.collection(collection_path).document(str(member.id))
     doc = doc_ref.get()
 
@@ -172,7 +116,6 @@ async def get_user_report_data(member: discord.Member, db, collection_path, days
 
     for status in statuses:
         status_total_sec = 0
-        # 過去7日間の日付フィールドを集計
         for i in range(days):
             date = (now - timedelta(days=i)).strftime("%Y-%m-%d")
             field = f'{date}_{status}_seconds'
@@ -185,7 +128,6 @@ async def get_user_report_data(member: discord.Member, db, collection_path, days
     return user_data
 
 async def send_user_report_embed(interaction: discord.Interaction, member: discord.Member, user_data: dict, days: int):
-    # データが空の場合はメッセージを送信して終了
     if not user_data or user_data['total'] == 0:
         await interaction.followup.send(f"⚠️ **{member.display_name}** さんの過去 {days} 日間の活動記録は見つかりませんでした。")
         return
@@ -202,9 +144,7 @@ async def send_user_report_embed(interaction: discord.Interaction, member: disco
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.set_footer(text=f"レポート生成時刻: {datetime.now(tz_jst).strftime('%Y/%m/%d %H:%M:%S JST')}")
 
-    # 各ステータスの時間と割合を計算し、フィールドに追加
     statuses = ['online', 'idle', 'dnd', 'offline']
-    
     status_field_value = []
     
     for status in statuses:
@@ -228,43 +168,83 @@ async def send_user_report_embed(interaction: discord.Interaction, member: disco
 
 
 # -----------------
-# Discord Bot本体の起動関数
+# Firestore初期化関数 (Base64デコードと一時ファイル処理)
+# -----------------
+def init_firestore():
+    global db
+    if db is not None:
+        return db
+
+    # Base64エンコードされた設定文字列を環境変数から取得
+    base64_config = os.getenv("__firebase_config")
+    
+    if not base64_config:
+        print("致命的エラー: __firebase_config 環境変数が設定されていません。")
+        return None
+
+    temp_file_path = None
+    try:
+        # 1. Base64文字列をデコードし、JSONバイトデータを取得
+        json_bytes = base64.b64decode(base64_config)
+        json_str = json_bytes.decode('utf-8')
+        
+        # 2. 一時ファイルを作成し、デコードしたJSONを書き込む
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, encoding='utf-8') as temp_file:
+            temp_file.write(json_str)
+            temp_file_path = temp_file.name
+
+        # 3. 認証を実行: credentials.Certificate() に一時ファイルのパスを渡す
+        cred = credentials.Certificate(temp_file_path)
+        
+        # 4. Firebaseアプリを初期化
+        firebase_admin.initialize_app(cred)
+        
+        db = firestore.client()
+        print("Firestore接続完了。")
+        return db
+        
+    except Exception as e:
+        print(f"Firestore初期化に失敗しました。認証情報（__firebase_config）を確認してください: {e}")
+        # Base64デコードやJSON解析エラーの詳細を追記
+        print("エラー詳細: Base64エンコードされたJSON文字列が不完全、または不正な可能性があります。")
+        return None
+    
+    finally:
+        # 5. 認証後、一時ファイルを削除
+        if temp_file_path and os.path.exists(temp_file_path):
+             os.remove(temp_file_path)
+
+
+# -----------------
+# Discord Bot本体の起動関数 (変更なし)
 # -----------------
 def run_discord_bot():
-    # 多重起動防止チェック
     if current_process().name != 'MainProcess':
         print(f"非メインプロセス ({current_process().name}) です。Botは起動しません。")
         return
 
-    # Firestoreの初期化
-    db = init_firestore()
-    if db is None:
+    if init_firestore() is None:
         print("Botはデータベース接続なしで起動できません。")
         return
 
     TOKEN = os.getenv("DISCORD_TOKEN") 
     
-    # 必要なインテントを設定
     intents = discord.Intents.default()
     intents.members = True 
     intents.presences = True 
     intents.message_content = True 
 
-    # Botインスタンスを初期化
     bot = StatusTrackerBot(command_prefix='!', intents=intents)
 
-    # /mytime コマンドの定義
     @bot.tree.command(name="mytime", description="指定したユーザーの過去7日間のオンライン時間をレポートします。")
     @app_commands.describe(member='活動時間を知りたいサーバーメンバー')
     async def mytime_command(interaction: discord.Interaction, member: discord.Member):
-        await interaction.response.defer() # 処理に時間がかかることをDiscordに通知
+        await interaction.response.defer()
         
         user_data = await get_user_report_data(member, db, bot.collection_path, days=7)
         
-        # レポート送信
         await send_user_report_embed(interaction, member, user_data, 7)
     
-    # Botの実行
     if TOKEN:
         try:
             bot.run(TOKEN)
@@ -274,17 +254,15 @@ def run_discord_bot():
         print("エラー: Botトークンが設定されていません。")
 
 # -----------------
-# Webサーバーのエンドポイント (gunicornがアクセスする場所)
+# Webサーバーのエンドポイント (変更なし)
 # -----------------
 @app.route('/')
 def home():
-    # 多重起動防止ロジック
     if current_process().name == 'MainProcess':
         if not hasattr(app, 'bot_thread_started'):
             app.bot_thread_started = True
             print("Webアクセスを検知。Discord Botの起動を試みます...")
             
-            # Botを別スレッドで起動
             Thread(target=run_discord_bot).start()
             
             return "Discord Bot is initializing... (Please check Discord in 10 seconds)"
