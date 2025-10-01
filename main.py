@@ -2,6 +2,7 @@ import discord
 import os
 import json
 import random
+import io # 新しくインポートを追加
 from discord import app_commands
 from discord.ext import commands
 from flask import Flask
@@ -108,13 +109,12 @@ def init_firestore():
         return None
 
     try:
-        # JSON文字列を辞書オブジェクトに変換 (例: {"type": "service_account", ...})
-        cred_dict = json.loads(firebase_config_str)
+        # JSON文字列をメモリ上のファイルのように扱います (io.StringIOを使用)
+        # これにより、環境変数設定時の予期しない改行やエンコードの問題を回避し、
+        # credentials.Certificate() が要求する形式で情報を渡します。
         
-        # サービスアカウント認証情報を初期化
-        # credentials.Certificate() には、ファイルパスではなく、
-        # 変換された辞書オブジェクトを直接渡すのが正しい方法です。
-        cred = credentials.Certificate(cred_dict)
+        # 重要なステップ: JSON文字列を読み込み、認証情報として直接使用
+        cred = credentials.Certificate(io.StringIO(firebase_config_str))
         
         # Firebaseアプリを初期化
         firebase_admin.initialize_app(cred)
@@ -123,9 +123,11 @@ def init_firestore():
         print("Firestore接続完了。")
         return db
     except Exception as e:
-        # 修正：エラー時にJSONの先頭を誤ってファイルパスとして表示させないようにする
-        print(f"Firestore初期化エラー: JSONの読み込みまたはFirebaseの初期化に失敗しました。{e}")
+        # 認証情報が間違っている、またはJSON文字列に問題がある場合のエラーログ
+        print(f"Firestore初期化に失敗しました。認証情報（__firebase_config）を確認してください: {e}")
         return None
+
+# ... その他のコードはそのまま ...
 
 # -----------------
 # レポート生成ヘルパー関数
