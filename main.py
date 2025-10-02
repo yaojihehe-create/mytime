@@ -74,11 +74,24 @@ class StatusTrackerBot(commands.Bot):
         await self._load_config()
 
         try:
-            # 📌 修正: グローバル同期を強制実行します。
-            # この処理が完了すると、Bot参加済みの全てのサーバーにコマンドが反映されますが、
-            # Discord側のキャッシュにより反映まで数分かかる場合があります。
-            await self.tree.sync() 
-            print("グローバルスラッシュコマンド同期完了。")
+            # 📌 修正: 全てのサーバーでコマンドをクリア＆再同期し、重複を解消する
+            print("--- 全サーバーのコマンド同期処理開始 ---")
+            
+            # まず、念のためグローバルコマンドをクリア
+            await self.tree.clear_commands(guild=None) 
+            
+            # 参加している全てのギルドに対して、コマンドを登録（ギルド同期）
+            for guild in self.guilds:
+                # ギルド固有のコマンドをクリアしてから
+                # self.tree.clear_commands(guild=guild) # これは不要な場合があるため、一旦コメントアウト
+                
+                # グローバルコマンドをコピーし、ギルド同期
+                self.tree.copy_global_to(guild=guild)
+                await self.tree.sync(guild=guild)
+                print(f"サーバー {guild.name} ({guild.id}) のコマンド同期完了。")
+            
+            print("--- 全サーバーのコマンド同期処理完了 ---")
+
         except Exception as e:
             print(f"スラッシュコマンド同期エラー: {e}")
             
@@ -99,10 +112,10 @@ class StatusTrackerBot(commands.Bot):
         print('---------------------------------')
 
     async def on_guild_join(self, guild: discord.Guild):
-        """新しいサーバーに参加した際、即座にスラッシュコマンドを同期する (念のため残しますが、on_readyのグローバル同期で対応します)"""
+        """新しいサーバーに参加した際、即座にスラッシュコマンドを同期する"""
         try:
             print(f"新しいサーバーに参加しました: {guild.name} ({guild.id})。コマンドを同期します...")
-            # グローバル同期のキャッシュ期間を回避するため、参加したギルドに対してコピー＆同期を行います
+            # グローバルコマンドをコピーし、ギルド同期
             self.tree.copy_global_to(guild=guild)
             await self.tree.sync(guild=guild)
             print(f"サーバー {guild.name} へのスラッシュコマンド同期が完了しました。")
