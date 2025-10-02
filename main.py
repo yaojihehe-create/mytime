@@ -74,35 +74,53 @@ class StatusTrackerBot(commands.Bot):
         await self._load_config()
 
         try:
-            # 📌 修正: 全てのサーバーでコマンドをクリア＆再同期し、重複を解消する
-            print("--- 全サーバーのコマンド同期処理開始 ---")
+            # 📌 コマンド重複解消のための強化されたクリア＆同期処理
+            print("--- 全サーバーのコマンド同期処理開始 (重複解消) ---")
             
-            # まず、念のためグローバルコマンドをクリア
+            # まず、グローバルコマンドを完全に削除
+            print("グローバルコマンドをクリアしています...")
             await self.tree.clear_commands(guild=None) 
-            
-            # 参加している全てのギルドに対して、コマンドを登録（ギルド同期）
+            await self.tree.sync(guild=None) # グローバル同期を一度実行して削除を確定させる
+            print("グローバルコマンド削除完了。")
+
+            # 参加している全てのギルドに対して、コマンドをコピー＆同期
             for guild in self.guilds:
-                # ギルド固有のコマンドをクリアしてから
-                # self.tree.clear_commands(guild=guild) # これは不要な場合があるため、一旦コメントアウト
-                
-                # グローバルコマンドをコピーし、ギルド同期
-                self.tree.copy_global_to(guild=guild)
-                await self.tree.sync(guild=guild)
-                print(f"サーバー {guild.name} ({guild.id}) のコマンド同期完了。")
+                try:
+                    # ギルド固有のコマンドも念のためクリア（古い重複を削除）
+                    await self.tree.clear_commands(guild=guild) 
+                    
+                    # グローバルに登録されているコマンド（現在は空）を一旦コピーしてから、
+                    # ローカルで登録されているコマンドを再同期する
+                    self.tree.copy_global_to(guild=guild)
+                    await self.tree.sync(guild=guild)
+                    print(f"サーバー {guild.name} ({guild.id}) のコマンド同期完了。")
+                except Exception as e:
+                    print(f"警告: サーバー {guild.name} のコマンド同期に失敗しました: {e}")
             
-            print("--- 全サーバーのコマンド同期処理完了 ---")
+            # 最後にグローバルコマンドを再同期し、ローカルに登録したコマンドをグローバルにも反映させる
+            await self.tree.sync()
+            print("--- 全サーバーのコマンド同期処理完了 (重複解消成功の可能性高) ---")
 
         except Exception as e:
-            print(f"スラッシュコマンド同期エラー: {e}")
+            # NoneTypeエラー回避のため、Botの起動自体は止めないようにログ出力のみ行う
+            print(f"致命的ではないスラッシュコマンド同期エラー: {e}")
             
+        # 2. 📌 記録漏れを防ぐための初期ステータス記録
         now = datetime.now(tz_jst)
+        print("ユーザーの初期ステータスを取得しています...")
         for guild in self.guilds:
+            # メンバーキャッシュがまだ構築中の可能性があるため、念のため待機
+            await guild.chunk() 
             for member in guild.members:
-                if member.id != self.user.id:
-                    status_key = str(member.status)
-                    last_status_updates[member.id] = (status_key, now)
+                if member.bot or member.id in last_status_updates:
+                    continue
+                
+                # Bot起動時の現在のステータスを記録し、次のステータス変更に備える
+                status_key = str(member.status)
+                last_status_updates[member.id] = (status_key, now)
+        print("初期ステータス記録完了。")
 
-        # 2. ロードされたIDに基づいてタスクを開始
+        # 3. ロードされたIDに基づいてタスクを開始
         if self.report_channel_id is not None:
             self.daily_report.start()
             print(f"日次レポートタスクを開始しました。送信先: {self.report_channel_id}")
@@ -115,7 +133,7 @@ class StatusTrackerBot(commands.Bot):
         """新しいサーバーに参加した際、即座にスラッシュコマンドを同期する"""
         try:
             print(f"新しいサーバーに参加しました: {guild.name} ({guild.id})。コマンドを同期します...")
-            # グローバルコマンドをコピーし、ギルド同期
+            # 新規サーバーでは重複がないため、コピー＆同期でOK
             self.tree.copy_global_to(guild=guild)
             await self.tree.sync(guild=guild)
             print(f"サーバー {guild.name} へのスラッシュコマンド同期が完了しました。")
@@ -123,6 +141,7 @@ class StatusTrackerBot(commands.Bot):
             print(f"新しいサーバーへのスラッシュコマンド同期エラー: {e}")
 
     async def on_presence_update(self, before, after):
+        # Bot自身、またはデータベースが未接続の場合はスキップ
         if after.id == self.user.id or db is None:
             return
 
@@ -131,26 +150,39 @@ class StatusTrackerBot(commands.Bot):
         now = datetime.now(tz_jst)
         current_status_key = str(after.status)
 
+        # 📌 記録の正確性を向上させるためのロジック
         if user_id in last_status_updates:
             prev_status_key, prev_time = last_status_updates[user_id]
         else:
+            # 記録がない場合、before.statusを初期ステータスとして扱う
             prev_status_key = str(before.status) if before.status else 'offline'
             prev_time = now
 
+        # ステータスが変わっていない場合は処理を終了
         if current_status_key == prev_status_key:
             return
 
+        # 経過時間を計算
         duration = (now - prev_time).total_seconds()
+        
+        # 経過時間フィールド名（例: online_seconds）
         field_name = f'{prev_status_key}_seconds'
-        date_field_name = f'{now.strftime("%Y-%m-%d")}_{field_name}'
+        
+        # 日付付き経過時間フィールド名（例: 2025-10-02_online_seconds）
+        date_field_name = f'{prev_time.strftime("%Y-%m-%d")}_{field_name}'
 
+        # 経過時間が0より大きい場合のみFirestoreに書き込み
         if duration > 0:
             doc_ref.set({
+                # 累計時間に加算
                 field_name: firestore.Increment(duration),
+                # 日付別時間に加算
                 date_field_name: firestore.Increment(duration),
+                # 最終更新時刻を記録
                 'last_updated': now
-            }, merge=True)
+            }, merge=True) # 既存のデータを保護するためにmerge=Trueを使用
 
+        # 最後に、現在のステータスと時刻を更新
         last_status_updates[user_id] = (current_status_key, now)
         
     # ----------------------------------------------------
@@ -256,7 +288,8 @@ def get_status_emoji(status):
 
 async def get_user_report_data(member: discord.Member, db, collection_path, days=7):
     doc_ref = db.collection(collection_path).document(str(member.id))
-    doc = doc_ref.get()
+    # Firestoreのget()は同期処理のため、to_threadを使用
+    doc = await asyncio.to_thread(doc_ref.get)
 
     if not doc.exists:
         return None
@@ -273,6 +306,7 @@ async def get_user_report_data(member: discord.Member, db, collection_path, days
     for status in statuses:
         status_total_sec = 0
         for i in range(days):
+            # 昨日からさかのぼって日付を計算
             date = (now - timedelta(days=i)).strftime("%Y-%m-%d")
             field = f'{date}_{status}_seconds'
             status_total_sec += data.get(field, 0)
