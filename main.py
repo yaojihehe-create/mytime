@@ -23,13 +23,12 @@ db = None
 last_status_updates = {}
 tz_jst = timezone(timedelta(hours=9)) # 日本時間 (JST)
 
-# 📌 修正点 1: コマンドを強制同期するターゲットサーバーIDを設定
+# 📌 修正点 1: コマンドを強制同期するターゲットサーバーIDを設定 (必須!)
 # ----------------------------------------------------
-# !!! ここをあなたのサーバーIDに置き換えてください !!!
+# !!! ここをあなたのサーバーIDに置き換えてください (数字のみ) !!!
 # ----------------------------------------------------
-TARGET_GUILD_ID = 1417850283131797506 # 例: 123456789012345678 (テストしたいサーバーのID)
+TARGET_GUILD_ID = 0 # 例: 123456789012345678 
 # ----------------------------------------------------
-
 
 # Botクライアントの定義
 class StatusTrackerBot(commands.Bot):
@@ -38,20 +37,22 @@ class StatusTrackerBot(commands.Bot):
         super().__init__(*args, **kwargs)
         self.app_id = os.getenv("__app_id", "default-app-id")
         self.collection_path = f'artifacts/{self.app_id}/public/data/user_status'
-        # チャンネル設定を保存するコレクションパス
-        self.config_doc_ref = None # Bot起動時にFirestore初期化後に設定
-        self.report_channel_id = None # Bot起動時にFirestoreからロードされる
+        self.config_doc_ref = None
+        self.report_channel_id = None
+        # ターゲットギルドのオブジェクトを定義
+        self.target_guild_object = discord.Object(id=TARGET_GUILD_ID)
 
     async def _initialize_db_references(self):
-        """dbが初期化された後、ドキュメント参照を設定する (dbの依存関係に対応)"""
+        """dbが初期化された後、ドキュメント参照を設定する"""
         global db
         if db is not None and self.config_doc_ref is None:
             self.config_doc_ref = db.collection(f'artifacts/{self.app_id}/public/data/bot_config').document('settings')
-            await self._load_config() # 参照が設定されたら設定をロードする
+            return True
+        return False
 
     async def _load_config(self):
         """FirestoreからレポートチャンネルIDをロードする"""
-        if self.config_doc_ref is None:
+        if not await self._initialize_db_references():
             return False
 
         try:
@@ -69,7 +70,7 @@ class StatusTrackerBot(commands.Bot):
 
     async def _save_config(self, channel_id: int):
         """FirestoreにレポートチャンネルIDを保存する"""
-        if self.config_doc_ref is None:
+        if not await self._initialize_db_references():
             print("エラー: データベース参照が未設定のため、設定を保存できません。")
             return False
 
@@ -86,39 +87,43 @@ class StatusTrackerBot(commands.Bot):
     async def on_ready(self):
         print('---------------------------------')
         print(f'Botがログインしました: {self.user.name}')
-        print('Botはサーバーのユーザー活動時間を記録します。')
         
-        # データベース参照の初期化と設定のロードを試みる (db初期化後に行う必要あり)
-        await self._initialize_db_references()
+        # 1. データベース設定のロード
+        await self._load_config()
 
+        # 2. コマンドの強制同期
         try:
-            # 📌 修正点 2: 特定のサーバーにコマンドを強制同期
-            target_guild = discord.Object(id=TARGET_GUILD_ID)
             print(f"--- ターゲットサーバー ({TARGET_GUILD_ID}) への強制同期処理開始 ---")
             
-            # 以前のグローバルコマンドをクリアし、ターゲットギルドにのみ同期
-            await self.tree.clear_commands(guild=target_guild) 
-            await self.tree.sync(guild=target_guild)
+            # ターゲットギルドにコマンドを同期
+            # 注意: Discord APIの遅延により、数分かかる場合があります。
+            await self.tree.sync(guild=self.target_guild_object)
             
             print(f"--- ターゲットサーバーへのコマンド同期完了 ---")
 
         except Exception as e:
+            # Botの起動自体は止めないが、エラーログを出力
             print(f"スラッシュコマンド同期中のエラー: {e}")
             
-        # 記録漏れを防ぐための初期ステータス記録
+        # 3. 記録漏れを防ぐための初期ステータス記録
         now = datetime.now(tz_jst)
         print("ユーザーの初期ステータスを取得しています...")
-        for guild in self.guilds:
-            await guild.chunk() 
-            for member in guild.members:
+        target_guild = self.get_guild(TARGET_GUILD_ID)
+        
+        if target_guild:
+            await target_guild.chunk() # メンバーキャッシュを強制的に取得
+            for member in target_guild.members:
                 if member.bot or member.id in last_status_updates:
                     continue
                 
                 status_key = str(member.status)
                 last_status_updates[member.id] = (status_key, now)
+        else:
+             print(f"警告: ターゲットサーバーID {TARGET_GUILD_ID} のサーバーが見つかりません。Botがそのサーバーに参加しているか確認してください。")
+
         print("初期ステータス記録完了。")
 
-        # ロードされたIDに基づいてタスクを開始
+        # 4. 定期タスクの開始
         if self.report_channel_id is not None:
             self.daily_report.start()
             print(f"日次レポートタスクを開始しました。送信先: {self.report_channel_id}")
@@ -126,8 +131,6 @@ class StatusTrackerBot(commands.Bot):
             print("レポートチャンネルIDが未設定のため、自動送信をスキップします。/set_report_channelで設定してください。")
             
         print('---------------------------------')
-
-    # 📌 修正点 3: on_guild_join はグローバル同期でのみ効果的なため削除
 
     async def on_presence_update(self, before, after):
         # Bot自身、またはデータベースが未接続の場合はスキップ
@@ -151,6 +154,8 @@ class StatusTrackerBot(commands.Bot):
 
         duration = (now - prev_time).total_seconds()
         field_name = f'{prev_status_key}_seconds'
+        
+        # 状態変更が日をまたいだ場合の処理 (簡略化のため、ここでは prev_time の日付を使用)
         date_field_name = f'{prev_time.strftime("%Y-%m-%d")}_{field_name}'
 
         if duration > 0:
@@ -163,27 +168,27 @@ class StatusTrackerBot(commands.Bot):
         last_status_updates[user_id] = (current_status_key, now)
         
     # ----------------------------------------------------
-    # 📌 日次レポートタスク (毎日 JST 00:00 実行)
+    # 日次レポートタスク (毎日 JST 00:00 実行)
     # ----------------------------------------------------
     @tasks.loop(time=time(0, 0, tzinfo=tz_jst)) 
     async def daily_report(self):
         await self._load_config() 
         
         if not self.is_ready() or db is None or self.report_channel_id is None:
-            print("自動レポートがスキップされました。Botの準備ができていないか、チャンネルIDが未設定です。")
             return
 
         report_channel = self.get_channel(self.report_channel_id)
         if not report_channel:
-            print(f"チャンネルID {self.report_channel_id} が見つからないか、アクセスできません。")
             return
 
         print("--- 日次レポート処理開始 (JST 00:00) ---")
 
-        for guild in self.guilds:
+        # ターゲットギルドのみを処理
+        target_guild = self.get_guild(TARGET_GUILD_ID)
+        if target_guild:
             days = 1 
             
-            for member in guild.members:
+            for member in target_guild.members:
                 if member.bot:
                     continue
                 
@@ -211,9 +216,12 @@ class StatusTrackerBot(commands.Bot):
                 
                 embed.set_footer(text=f"レポート生成時刻: {datetime.now(tz_jst).strftime('%Y/%m/%d %H:%M:%S JST')}")
 
-                await report_channel.send(embed=embed)
-                await asyncio.sleep(0.5) 
-        
+                try:
+                    await report_channel.send(embed=embed)
+                    await asyncio.sleep(0.5) 
+                except Exception as e:
+                    print(f"レポート送信失敗 (ユーザーID: {member.id}): {e}")
+
         print("--- 日次レポート処理完了 ---")
         
     @daily_report.before_loop
@@ -222,10 +230,10 @@ class StatusTrackerBot(commands.Bot):
 
 
 # -----------------
-# レポート表示用のヘルパー関数 (変更なし)
+# ヘルパー関数 (変更なし)
 # -----------------
 def format_time(seconds: float) -> str:
-    """秒数（float）を HH時間 MM分 SS秒 の形式にフォーマットする (ミリ秒表示対応)"""
+    # ... (省略: 前のコードと同じ) ...
     if seconds < 0:
         return f"({format_time(abs(seconds))})"
         
@@ -249,6 +257,7 @@ def format_time(seconds: float) -> str:
     return " ".join(parts)
 
 def get_status_emoji(status):
+    # ... (省略: 前のコードと同じ) ...
     if status == 'online': return '🟢 オンライン'
     if status == 'idle': return '🌙 退席中'
     if status == 'dnd': return '🔴 取り込み中'
@@ -256,6 +265,7 @@ def get_status_emoji(status):
     return status.capitalize()
 
 async def get_user_report_data(member: discord.Member, db, collection_path, days=7):
+    # ... (省略: 前のコードと同じ) ...
     doc_ref = db.collection(collection_path).document(str(member.id))
     doc = await asyncio.to_thread(doc_ref.get)
 
@@ -294,7 +304,7 @@ async def get_user_report_data(member: discord.Member, db, collection_path, days
     return user_data
 
 async def send_user_report_embed(interaction: discord.Interaction, member: discord.Member, user_data: dict, days: int):
-    
+    # ... (省略: 前のコードと同じ) ...
     online_time = user_data.get('online_time_s', 0)
     offline_time = user_data.get('offline_time_s', 0)
     total_sec = online_time + offline_time
@@ -358,7 +368,7 @@ async def send_user_report_embed(interaction: discord.Interaction, member: disco
 
 
 # -----------------
-# Firestore初期化関数
+# Firestore初期化関数 (変更なし)
 # -----------------
 def init_firestore():
     global db
@@ -382,7 +392,6 @@ def init_firestore():
             temp_file_path = temp_file.name
 
         cred = credentials.Certificate(temp_file_path)
-        # Firebaseアプリが既に初期化されているかチェック
         if not firebase_admin._apps:
             firebase_admin.initialize_app(cred)
         
@@ -408,7 +417,6 @@ def run_discord_bot():
         print(f"非メインプロセス ({current_process().name}) です。Botは起動しません。")
         return
 
-    # データベースの初期化を試みる
     if init_firestore() is None:
         return 
 
@@ -421,7 +429,10 @@ def run_discord_bot():
 
     bot = StatusTrackerBot(command_prefix='!', intents=intents)
 
-    @bot.tree.command(name="set_report_channel", description="日次レポートの送信先チャンネルを設定します。", guild=discord.Object(id=TARGET_GUILD_ID))
+    # 📌 コマンド定義: TARGET_GUILD_IDにのみ適用される
+    guild_id_object = discord.Object(id=TARGET_GUILD_ID)
+
+    @bot.tree.command(name="set_report_channel", description="日次レポートの送信先チャンネルを設定します。", guild=guild_id_object)
     @app_commands.describe(channel='レポートを送信するテキストチャンネル')
     async def set_report_channel_command(interaction: discord.Interaction, channel: discord.TextChannel):
         await interaction.response.defer(ephemeral=True)
@@ -432,10 +443,6 @@ def run_discord_bot():
             await interaction.followup.send("❌ データベースが接続されていません。デプロイを確認してください。", ephemeral=True)
             return
 
-        # Botのデータベース参照が設定されていなかった場合、ここで初期化を試みる
-        if bot.config_doc_ref is None:
-            await bot._initialize_db_references()
-        
         if await bot._save_config(channel_id):
             
             if bot.daily_report.is_running():
@@ -448,7 +455,7 @@ def run_discord_bot():
         else:
             await interaction.followup.send("❌ 設定の保存に失敗しました。", ephemeral=True)
 
-    @bot.tree.command(name="mytime", description="指定した期間の活動時間レポートを表示します。", guild=discord.Object(id=TARGET_GUILD_ID))
+    @bot.tree.command(name="mytime", description="指定した期間の活動時間レポートを表示します。", guild=guild_id_object)
     @app_commands.choices(period=[
         app_commands.Choice(name="1日 (昨日)", value=1),
         app_commands.Choice(name="3日間", value=3)
@@ -469,7 +476,7 @@ def run_discord_bot():
         
         await send_user_report_embed(interaction, target_member, user_data, days)
     
-    @bot.tree.command(name="send_report_test", description="設定されたチャンネルへテストレポートを送信します。", guild=discord.Object(id=TARGET_GUILD_ID))
+    @bot.tree.command(name="send_report_test", description="設定されたチャンネルへテストレポートを送信します。", guild=guild_id_object)
     async def send_report_test_command(interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
@@ -477,10 +484,10 @@ def run_discord_bot():
             await interaction.followup.send("❌ データベースが接続されていません。デプロイを確認してください。", ephemeral=True)
             return
 
-        # Botのデータベース参照が設定されていなかった場合、ここで初期化を試みる
-        if bot.config_doc_ref is None:
-            await bot._initialize_db_references()
-            
+        if bot.report_channel_id is None:
+            # config_doc_refが未設定の場合、ここでロードを試みる
+            await bot._load_config()
+
         channel_id = bot.report_channel_id 
         
         if channel_id is None:
