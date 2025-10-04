@@ -10,14 +10,28 @@ from threading import Thread
 from multiprocessing import current_process
 from datetime import datetime, timedelta, timezone, time 
 import asyncio
+import logging # ログ出力を強化するために追加
+
+# ログ設定: BotのカスタムメッセージとFirebaseログも表示できるように設定
+# formatを指定することで、ログ出力をより詳細にします。
+logging.basicConfig(
+    level=logging.INFO, # カスタムBotコードやINFOレベルのメッセージを表示
+    format='%(asctime)s %(levelname)s %(name)s: %(message)s'
+)
+# Discordライブラリ自体のロガーをデバッグレベルに設定
+discord_logger = logging.getLogger('discord')
+# ログレベルをDEBUGに設定することで、接続に関する詳細な情報を出力します
+discord_logger.setLevel(logging.DEBUG) 
+
 
 # Firebase/Firestore関連のインポート
 try:
     import firebase_admin
     from firebase_admin import credentials, firestore
 except ImportError:
-    print("警告: 'firebase-admin'ライブラリが見つかりません。Botを実行するにはインストールが必要です。")
-    exit()
+    # 実際にはCanvas環境で実行されるため、このexitは不要だが、コードの整合性のため残す
+    logging.warning("警告: 'firebase-admin'ライブラリが見つかりません。Botを実行するにはインストールが必要です。")
+    # exit() # コメントアウト
 
 
 # Flaskのアプリケーションインスタンスを作成（Webサーバーとして機能）
@@ -64,53 +78,54 @@ class StatusTrackerBot(commands.Bot):
             doc = await asyncio.to_thread(self.config_doc_ref.get)
             if doc.exists and 'report_channel_id' in doc.to_dict():
                 self.report_channel_id = doc.to_dict()['report_channel_id']
-                print(f"FirestoreからレポートチャンネルIDをロード: {self.report_channel_id}")
+                logging.info(f"FirestoreからレポートチャンネルIDをロード: {self.report_channel_id}")
                 return True
             else:
-                print("FirestoreにレポートチャンネルIDが見つかりませんでした。")
+                logging.info("FirestoreにレポートチャンネルIDが見つかりませんでした。")
                 return False
         except Exception as e:
-            print(f"設定ロード中にエラーが発生しました: {e}")
+            logging.error(f"設定ロード中にエラーが発生しました: {e}")
             return False
 
     async def _save_config(self, channel_id: int):
         """FirestoreにレポートチャンネルIDを保存する"""
         if not await self._initialize_db_references():
-            print("エラー: データベース参照が未設定のため、設定を保存できません。")
+            logging.error("エラー: データベース参照が未設定のため、設定を保存できません。")
             return False
 
         try:
             # blocking I/O (Firestore set)をasyncio.to_threadで非同期に実行
             await asyncio.to_thread(self.config_doc_ref.set, 
-                                     {'report_channel_id': channel_id}, 
-                                     merge=True)
+                                    {'report_channel_id': channel_id}, 
+                                    merge=True)
             self.report_channel_id = channel_id
             return True
         except Exception as e:
-            print(f"設定保存中にエラーが発生しました: {e}")
+            logging.error(f"設定保存中にエラーが発生しました: {e}")
             return False
 
     async def on_ready(self):
-        print('---------------------------------')
-        print(f'Botがログインしました: {self.user.name}')
+        # 起動成功の確実なログ
+        logging.info('---------------------------------')
+        logging.info(f'Botがログインしました: {self.user.name}')
         
         # 1. データベース設定のロード
         await self._load_config()
 
         # 2. コマンドの強制同期 (グローバルコマンドとして同期)
         try:
-            print("--- グローバルへの強制同期処理開始 (反映に最大1時間かかる場合があります) ---")
+            logging.info("--- グローバルへの強制同期処理開始 (反映に最大1時間かかる場合があります) ---")
             # 参加している全サーバーに反映されるグローバルコマンドとして同期
             await self.tree.sync() 
-            print("--- グローバルへのコマンド同期完了 ---")
+            logging.info("--- グローバルへのコマンド同期完了 ---")
 
         except Exception as e:
             # 403 Forbiddenなどのエラーが出ても、コマンドが既に登録されていれば動作するため、警告レベルに留める
-            print(f"警告: スラッシュコマンド同期中のエラー: {e}")
+            logging.warning(f"警告: スラッシュコマンド同期中のエラー: {e}")
             
         # 3. 記録漏れを防ぐための初期ステータス記録
         now = datetime.now(tz_jst)
-        print("ユーザーの初期ステータスを取得しています...")
+        logging.info("ユーザーの初期ステータスを取得しています...")
         
         # 参加している全サーバーのメンバーを対象に初期ステータスを記録
         # 注: 多数のサーバーに参加している場合、この処理に時間がかかることがあります。
@@ -125,21 +140,21 @@ class StatusTrackerBot(commands.Bot):
                     status_key = str(member.status)
                     last_status_updates[member.id] = (status_key, now)
             except discord.Forbidden:
-                print(f"警告: サーバー '{guild.name}' ({guild.id}) でメンバー情報の読み取りが拒否されました。PRESENCE INTENTとSERVER MEMBERS INTENTを確認してください。")
+                logging.warning(f"警告: サーバー '{guild.name}' ({guild.id}) でメンバー情報の読み取りが拒否されました。PRESENCE INTENTとSERVER MEMBERS INTENTを確認してください。")
             except Exception as e:
-                print(f"初期ステータス記録中にエラーが発生しました ({guild.name}): {e}")
+                logging.error(f"初期ステータス記録中にエラーが発生しました ({guild.name}): {e}")
 
-        print("初期ステータス記録完了。")
+        logging.info("初期ステータス記録完了。")
 
         # 4. 定期タスクの開始
         if self.report_channel_id is not None:
             if not self.daily_report.is_running():
                 self.daily_report.start()
-                print(f"日次レポートタスクを開始しました。送信先: {self.report_channel_id}")
+                logging.info(f"日次レポートタスクを開始しました。送信先: {self.report_channel_id}")
         else:
-            print("レポートチャンネルIDが未設定のため、自動送信をスキップします。/set_report_channelで設定してください。")
+            logging.info("レポートチャンネルIDが未設定のため、自動送信をスキップします。/set_report_channelで設定してください。")
             
-        print('---------------------------------')
+        logging.info('---------------------------------')
 
     async def on_presence_update(self, before, after):
         # Bot自身、またはデータベースが未接続の場合はスキップ
@@ -165,7 +180,7 @@ class StatusTrackerBot(commands.Bot):
             
         # ログ出力の追加 (ユーザーが確認できるため安心につながります)
         log_time = now.strftime("%Y-%m-%d %H:%M:%S JST")
-        print(f"[{log_time}] {after.display_name} ({after.id}) のステータスが {get_status_emoji(prev_status_key)} から {get_status_emoji(current_status_key)} に変更されました。")
+        logging.info(f"[{log_time}] {after.display_name} ({after.id}) のステータスが {get_status_emoji(prev_status_key)} から {get_status_emoji(current_status_key)} に変更されました。")
 
 
         duration = (now - prev_time).total_seconds()
@@ -196,7 +211,7 @@ class StatusTrackerBot(commands.Bot):
         
         # ログ出力: メンバー参加と初期ステータス
         log_time = now.strftime("%Y-%m-%d %H:%M:%S JST")
-        print(f"[{log_time}] 🆕 {member.guild.name} にメンバーが参加しました: {member.display_name} ({member.id}) - 初期ステータス: {get_status_emoji(status_key)}")
+        logging.info(f"[{log_time}] 🆕 {member.guild.name} にメンバーが参加しました: {member.display_name} ({member.id}) - 初期ステータス: {get_status_emoji(status_key)}")
         
         # last_status_updates に初期ステータスを登録
         # これにより、この時点から時間計測が開始される
@@ -210,7 +225,7 @@ class StatusTrackerBot(commands.Bot):
             
         now = datetime.now(tz_jst)
         log_time = now.strftime("%Y-%m-%d %H:%M:%S JST")
-        print(f"[{log_time}] 🚪 {member.guild.name} からメンバーが退出しました: {member.display_name} ({member.id})")
+        logging.info(f"[{log_time}] 🚪 {member.guild.name} からメンバーが退出しました: {member.display_name} ({member.id})")
 
         # last_status_updates から削除（メモリ解放のため）
         if member.id in last_status_updates:
@@ -225,12 +240,12 @@ class StatusTrackerBot(commands.Bot):
         await self._load_config() 
         
         if not self.is_ready() or db is None or self.report_channel_id is None:
-            print("警告: レポートタスクの実行条件が満たされていません。")
+            logging.warning("警告: レポートタスクの実行条件が満たされていません。")
             return
 
         report_channel = self.get_channel(self.report_channel_id)
         if not report_channel:
-            print(f"警告: レポートチャンネルID {self.report_channel_id} が無効です。")
+            logging.warning(f"警告: レポートチャンネルID {self.report_channel_id} が無効です。")
             return
 
         # チャンネルが属するサーバーIDを取得
@@ -238,10 +253,10 @@ class StatusTrackerBot(commands.Bot):
         target_guild = self.get_guild(target_guild_id)
         
         if not target_guild:
-            print(f"警告: レポートチャンネル ({self.report_channel_id}) のサーバーが見つかりません。")
+            logging.warning(f"警告: レポートチャンネル ({self.report_channel_id}) のサーバーが見つかりません。")
             return
             
-        print(f"--- 日次レポート処理開始 ({target_guild.name}, JST 00:00) ---")
+        logging.info(f"--- 日次レポート処理開始 ({target_guild.name}, JST 00:00) ---")
 
         days = 1 # 昨日1日間のレポート
             
@@ -280,9 +295,9 @@ class StatusTrackerBot(commands.Bot):
                 await report_channel.send(embed=embed)
                 await asyncio.sleep(0.5) # レートリミット回避のための一時停止
             except Exception as e:
-                print(f"レポート送信失敗 (ユーザーID: {member.id}): {e}")
+                logging.error(f"レポート送信失敗 (ユーザーID: {member.id}): {e}")
 
-        print("--- 日次レポート処理完了 ---")
+        logging.info("--- 日次レポート処理完了 ---")
         
     @daily_report.before_loop
     async def before_daily_report(self):
@@ -387,7 +402,7 @@ async def send_user_report_embed(interaction: discord.Interaction, member: disco
 
     total_formatted = format_time(total_sec)
     online_formatted = format_time(online_time)
-    offline_formatted = format_time(offline_time)
+    offline_formatted = format_time(offline_formatted)
     
     embed = discord.Embed(
         title=f"⏳ {member.display_name} さんの活動時間レポート",
@@ -452,7 +467,7 @@ def init_firestore():
     base64_config = os.getenv("__firebase_config")
     
     if not base64_config:
-        print("致命的エラー: __firebase_config 環境変数が設定されていません。")
+        logging.critical("致命的エラー: __firebase_config 環境変数が設定されていません。")
         return None 
 
     temp_file_path = None
@@ -472,11 +487,11 @@ def init_firestore():
             firebase_admin.initialize_app(cred)
             
         db = firestore.client()
-        print("Firestore接続完了。")
+        logging.info("Firestore接続完了。")
         return db
         
     except Exception as e:
-        print(f"Firestore初期化に失敗しました。認証情報（__firebase_config）を確認してください: {e}")
+        logging.error(f"Firestore初期化に失敗しました。認証情報（__firebase_config）を確認してください: {e}")
         return None
     
     finally:
@@ -490,12 +505,12 @@ def init_firestore():
 # -----------------
 def run_discord_bot():
     if current_process().name != 'MainProcess':
-        print(f"非メインプロセス ({current_process().name}) です。Botは起動しません。")
+        logging.info(f"非メインプロセス ({current_process().name}) です。Botは起動しません。")
         return
 
     # Firestore接続を試みる
     if init_firestore() is None:
-        print("Botの起動を停止します。Firestore接続エラーを確認してください。")
+        logging.critical("Botの起動を停止します。Firestore接続エラーを確認してください。")
         return 
 
     TOKEN = os.getenv("DISCORD_TOKEN")
@@ -594,18 +609,19 @@ def run_discord_bot():
             else:
                 await interaction.followup.send(f"❌ チャンネルID `{channel_id}` が見つからないか、Botにアクセス権限がありません。", ephemeral=True)
         except Exception as e:
-            print(f"レポート送信エラー: {e}")
+            logging.error(f"レポート送信エラー: {e}")
             await interaction.followup.send("エラーが発生しました。", ephemeral=True)
 
 
     if TOKEN:
         try:
             # Botを実行
-            bot.run(TOKEN)
+            # ロガーを強化した状態で実行することで、接続エラーがあればログに出力される
+            bot.run(TOKEN, log_handler=None) 
         except Exception as e:
-            print(f"Discord Bot 起動失敗: {e}")
+            logging.critical(f"Discord Bot 起動失敗: {e}")
     else:
-        print("エラー: Botトークンが設定されていません。")
+        logging.critical("エラー: Botトークンが設定されていません。")
 
 # -----------------
 # Webサーバーのエンドポイント (Botを起動するためのエントリーポイント)
@@ -615,7 +631,7 @@ def home():
     if current_process().name == 'MainProcess':
         if not hasattr(app, 'bot_thread_started'):
             app.bot_thread_started = True
-            print("Webアクセスを検知。Discord Botの起動を試みます...")
+            logging.info("Webアクセスを検知。Discord Botの起動を試みます...")
             
             # Botの実行はブロッキングなので、別スレッドで実行
             Thread(target=run_discord_bot).start()
