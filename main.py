@@ -701,10 +701,14 @@ def run_bot():
     try:
         # Note: run()はブロッキング関数であり、Botが切断されるまで戻らない
         logging.info("Botクライアントを起動しています...")
+        logging.info(f"🔑 Discordに接続を試行しています... (Process ID: {os.getpid()})")
         bot.run(DISCORD_BOT_TOKEN) 
     except Exception as e:
         # Bot実行中の致命的なエラーを捕捉
         logging.error(f"❌ Bot実行中に致命的なエラーが発生しました: {e}", exc_info=True)
+    
+    # Bot.run()が予期せず終了した場合（ホスティング環境による強制終了や未捕捉の致命的エラーなど）
+    logging.critical("🛑 Botのメインループが予期せず終了しました。ホスティング環境による強制終了または未捕捉の致命的なエラーが原因の可能性があります。")
 
 
 def init_firestore():
@@ -721,6 +725,7 @@ def init_firestore():
             return
             
         firebase_config = json.loads(firebase_config_str)
+        logging.debug("✅ __firebase_config環境変数をロードし、JSONとして解析しました。")
         
         # Firebase Admin SDKの初期化
         # Admin SDKの資格情報を、GCP/Firebaseのプロジェクト設定に基づいて作成
@@ -780,7 +785,7 @@ def start_bot_and_webserver():
     bot_thread = Thread(target=run_bot, name="DiscordBotThread")
     bot_thread.daemon = True # メインプロセス終了時にスレッドも終了
     bot_thread.start()
-    logging.info(f"Bot実行スレッド: {bot_thread.name} ({bot_thread.ident}) が起動しました。")
+    logging.info(f"Bot実行スレッド: {bot_thread.name} (Thread ID: {bot_thread.ident}) が起動しました。メインプロセス ID: {os.getpid()}")
 
     # 3. Flask Webサーバーの起動 (この関数を呼び出したプロセス/スレッドが担当)
     # 外部からのアクセスを許可するために host='0.0.0.0' を指定
