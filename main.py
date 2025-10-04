@@ -34,15 +34,6 @@ except ImportError:
 # Flaskのアプリケーションインスタンスを作成（Webサーバーとして機能）
 app = Flask(__name__)
 
-# Renderのヘルスチェック用ルートを追加 (Webサーバーの安定稼働のために必須)
-@app.route('/')
-def health_check():
-    """Renderのヘルスチェックに応答するためのルート。"""
-    # Botスレッドが開始されたことを確認するログを出力
-    global bot_thread
-    status = "Bot is running." if bot_thread and bot_thread.is_alive() else "Bot is starting or failed."
-    return f"Bot is running and connected to Discord. ({status})", 200
-
 # Firestore接続とBotの状態管理のためのグローバル変数
 db = None
 # 直前のユーザーのステータスと、その状態に移行した時刻 (ユーザーID -> (ステータスキー, datetimeオブジェクト))
@@ -50,7 +41,28 @@ last_status_updates = {}
 tz_jst = timezone(timedelta(hours=9)) # 日本時間 (JST)
 # Botスレッドの状態管理用グローバル変数
 bot_thread = None
+# Botの準備完了状態を示すフラグ (Discordへの接続が完了したか)
+bot_ready_status = False # 新しいグローバル変数
 
+# Renderのヘルスチェック用ルートを追加 (Webサーバーの安定稼働のために必須)
+@app.route('/')
+def health_check():
+    """Renderのヘルスチェックに応答するためのルート。"""
+    global bot_thread, bot_ready_status # bot_ready_statusを追加
+    
+    status = "Bot is starting or failed."
+    
+    # Botスレッドが生きていれば
+    if bot_thread and bot_thread.is_alive():
+        # Discordへの接続が完了していれば
+        if bot_ready_status:
+            status = "Bot is running and ready."
+        # スレッドは生きているが、まだ接続完了前であれば
+        else:
+            status = "Bot is connecting..."
+            
+    # メッセージをシンプルにし、Botの状態を正確に反映
+    return f"Status Check: {status}", 200
 
 # Botクライアントの定義
 class StatusTrackerBot(commands.Bot):
@@ -109,9 +121,14 @@ class StatusTrackerBot(commands.Bot):
             return False
 
     async def on_ready(self):
+        global bot_ready_status # グローバルフラグにアクセス
+
         # 起動成功の確実なログ
         logging.info('---------------------------------')
         logging.info(f'Botがログインしました: {self.user.name}')
+        
+        # Botの準備完了フラグをTrueに設定
+        bot_ready_status = True 
         
         # 1. データベース設定のロード
         await self._load_config()
@@ -235,7 +252,50 @@ class StatusTrackerBot(commands.Bot):
         # last_status_updates から削除（メモリ解放のため）
         if member.id in last_status_updates:
             del last_status_updates[member.id]
+            
+    async def on_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        """スラッシュコマンド実行中に発生したエラーを処理する"""
         
+        # コマンドが見つからないエラーは無視
+        if isinstance(error, app_commands.CommandNotFound):
+            return
+
+        # 権限エラーの場合
+        if isinstance(error, app_commands.MissingPermissions) or isinstance(error, app_commands.MissingRole):
+            # interaction.response.send_message の呼び出しを try-except で囲み、エラーを防ぐ
+            try:
+                await interaction.response.send_message(
+                    "❌ **権限がありません**。\nこのコマンドを実行するには、必要なサーバー権限（例: チャンネル管理）が必要です。", 
+                    ephemeral=True
+                )
+            except discord.InteractionResponded:
+                 # 既に応答済みなら follow up で送信
+                 await interaction.followup.send(
+                    "❌ **権限がありません**。\nこのコマンドを実行するには、必要なサーバー権限（例: チャンネル管理）が必要です。", 
+                    ephemeral=True
+                )
+                 
+            logging.warning(f"権限エラー: ユーザー {interaction.user.id} がコマンド '{interaction.command.name}' の実行に必要な権限を持っていません。")
+            return
+
+        # その他のエラー
+        logging.error(f"コマンド '{interaction.command.name}' の実行中に予期せぬエラーが発生しました: {error}", exc_info=True)
+        
+        # ユーザーにエラーを通知
+        error_message = f"❌ コマンド実行中にエラーが発生しました。\n`{error.__class__.__name__}: {error}`\n詳細はBotのログを確認してください。"
+        
+        # 既にレスポンスが送信されているか確認
+        if interaction.response.is_done():
+            # 既に defer されている場合、followup でエラーメッセージを送信
+            await interaction.followup.send(error_message, ephemeral=True)
+        else:
+            # まだ応答していない場合、response でエラーメッセージを送信
+            try:
+                await interaction.response.send_message(error_message, ephemeral=True)
+            except discord.HTTPException as e:
+                # 稀に response.is_done() が false のまま HTTP エラーが発生する場合があるため、ログに出力
+                logging.error(f"応答送信時の HTTP エラー: {e}")
+            
     # ----------------------------------------------------
     # 日次レポートタスク (毎日 JST 00:00 実行)
     # ----------------------------------------------------
@@ -531,6 +591,7 @@ def run_discord_bot():
     intents.presences = True
     intents.message_content = True # スラッシュコマンドでは必須ではないが、一応含める
 
+    # Botインスタンスの作成
     bot = StatusTrackerBot(command_prefix='!', intents=intents)
 
     # 📌 コマンド定義: グローバルコマンドとして登録
@@ -588,10 +649,10 @@ def run_discord_bot():
             await send_user_report_embed(interaction, target_member, user_data, days)
             
         except Exception as e:
+            # ここで例外を捕捉しても on_app_command_error が実行されるため、ここではロギングのみ
             logging.error(f"/mytime コマンド処理中に予期せぬエラーが発生しました: {e}")
-            # エラーが発生した場合でも、必ずフォローアップメッセージを送信して「考え中...」を解除する
-            await interaction.followup.send("❌ レポートの生成中にエラーが発生しました。\n詳細は Bot のログを確認してください。", ephemeral=True)
-
+            # エラーが発生した場合でも、必ずフォローアップメッセージを送信して「考え中...」を解除する処理は on_app_command_error が担当
+            
     
     @bot.tree.command(name="send_report_test", description="設定されたチャンネルへテストレポートを送信します。")
     @app_commands.default_permissions(manage_channels=True) # チャンネル管理権限を持つユーザーのみ実行可能
@@ -631,7 +692,14 @@ def run_discord_bot():
 
     if TOKEN:
         # Botを起動（この呼び出しはブロックされます）
-        bot.run(TOKEN)
+        try:
+             bot.run(TOKEN)
+        except Exception as e:
+            global bot_ready_status
+            # Botがクラッシュした場合、フラグをリセットしてヘルスチェックが失敗状態を報告するようにする
+            bot_ready_status = False 
+            logging.critical(f"Botスレッドで致命的なエラーが発生し、終了しました: {e}")
+            
     else:
         logging.critical("致命的エラー: DISCORD_TOKEN 環境変数が設定されていません。")
 
