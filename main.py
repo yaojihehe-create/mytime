@@ -36,7 +36,7 @@ tz_jst = timezone(timedelta(hours=9)) # 日本時間 (JST)
 # !!! ここをあなたのBotを導入したいサーバーのIDに置き換えてください (数字のみ) !!!
 # !!! サーバーIDが設定されていないと、Botは動作しません !!!
 # 例: TARGET_GUILD_ID = 123456789012345678
-TARGET_GUILD_ID = 0 
+TARGET_GUILD_ID = 1417850283131797506 
 # ====================================================
 
 if TARGET_GUILD_ID == 0:
