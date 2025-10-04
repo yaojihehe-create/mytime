@@ -6,14 +6,13 @@ import base64
 from discord import app_commands
 from discord.ext import commands, tasks
 from flask import Flask
-from threading import Thread
+from threading import Thread # スレッド処理のために必須
 from multiprocessing import current_process
 from datetime import datetime, timedelta, timezone, time 
 import asyncio
 import logging 
 
 # ログ設定: BotのカスタムメッセージとFirebaseログも表示できるように設定
-# formatを指定することで、ログ出力をより詳細にします。
 logging.basicConfig(
     level=logging.INFO, # カスタムBotコードやINFOレベルのメッセージを表示
     format='%(asctime)s %(levelname)s %(name)s: %(message)s'
@@ -35,11 +34,22 @@ except ImportError:
 # Flaskのアプリケーションインスタンスを作成（Webサーバーとして機能）
 app = Flask(__name__)
 
+# Renderのヘルスチェック用ルートを追加 (Webサーバーの安定稼働のために必須)
+@app.route('/')
+def health_check():
+    """Renderのヘルスチェックに応答するためのルート。"""
+    # Botスレッドが開始されたことを確認するログを出力
+    global bot_thread
+    status = "Bot is running." if bot_thread and bot_thread.is_alive() else "Bot is starting or failed."
+    return f"Bot is running and connected to Discord. ({status})", 200
+
 # Firestore接続とBotの状態管理のためのグローバル変数
 db = None
 # 直前のユーザーのステータスと、その状態に移行した時刻 (ユーザーID -> (ステータスキー, datetimeオブジェクト))
 last_status_updates = {} 
 tz_jst = timezone(timedelta(hours=9)) # 日本時間 (JST)
+# Botスレッドの状態管理用グローバル変数
+bot_thread = None
 
 
 # Botクライアントの定義
@@ -389,6 +399,7 @@ async def send_user_report_embed(interaction: discord.Interaction, member: disco
     
     # ユーザーデータが存在しないか、合計時間が0の場合はエラーメッセージを返す
     if not user_data or user_data.get('total', 0) == 0:
+        # 応答待ちを解除
         await interaction.followup.send(f"⚠️ **{member.display_name}** さんの過去 {days} 日間の活動記録は見つかりませんでした。")
         return
 
@@ -504,10 +515,8 @@ def init_firestore():
 # Discord Bot本体の起動関数
 # -----------------
 def run_discord_bot():
-    if current_process().name != 'MainProcess':
-        logging.info(f"非メインプロセス ({current_process().name}) です。Botは起動しません。")
-        return
-
+    """Botを起動し、ブロックする。専用スレッドで実行されることを想定。"""
+    
     # Firestore接続を試みる
     if init_firestore() is None:
         logging.critical("Botの起動を停止します。Firestore接続エラーを確認してください。")
@@ -621,6 +630,37 @@ def run_discord_bot():
 
 
     if TOKEN:
+        # Botを起動（この呼び出しはブロックされます）
         bot.run(TOKEN)
     else:
         logging.critical("致命的エラー: DISCORD_TOKEN 環境変数が設定されていません。")
+
+# -----------------
+# Bot起動スレッド設定
+# -----------------
+def start_bot_thread():
+    """Discord Botを専用のバックグラウンドスレッドで起動する"""
+    global bot_thread
+    
+    # 既に起動している場合はスキップ
+    if bot_thread is not None and bot_thread.is_alive():
+        logging.info("Botスレッドは既に起動中です。")
+        return
+
+    logging.info("Discord Botをバックグラウンドスレッドで起動します...")
+    
+    # run_discord_bot関数をターゲットに関数を実行するスレッドを作成
+    bot_thread = Thread(target=run_discord_bot)
+    
+    # Botスレッドをデーモン化 (メインプロセス終了時に自動で終了)
+    bot_thread.daemon = True 
+    bot_thread.start()
+    logging.info("Discord Botスレッドが開始されました。")
+    
+# -----------------
+# アプリケーション起動
+# -----------------
+# Gunicornがメインモジュールをロードした際にBotスレッドを開始する
+# これにより、Flask (Web) と Discord Bot (Async) が並行して動作する
+start_bot_thread() 
+# Flaskアプリ 'app' は Gunicorn によって自動的に提供されます。
