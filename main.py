@@ -12,7 +12,6 @@ from datetime import datetime, timedelta, timezone, time
 import asyncio
 
 # Firebase/Firestore関連のインポート
-# 注: このプロジェクトではfirebase_adminが使用できる環境が必要です。
 try:
     import firebase_admin
     from firebase_admin import credentials, firestore
@@ -26,22 +25,13 @@ app = Flask(__name__)
 
 # Firestore接続とBotの状態管理のためのグローバル変数
 db = None
-# 直前のユーザーのステータスと、その状態に移行した時刻 (ステータスキー, datetimeオブジェクト)
+# 直前のユーザーのステータスと、その状態に移行した時刻 (ユーザーID -> (ステータスキー, datetimeオブジェクト))
 last_status_updates = {} 
 tz_jst = timezone(timedelta(hours=9)) # 日本時間 (JST)
 
-# ====================================================
-# 🚨 必須の修正点 1: ターゲットサーバーIDを設定 🚨
-# ----------------------------------------------------
-# !!! ここをあなたのBotを導入したいサーバーのIDに置き換えてください (数字のみ) !!!
-# !!! サーバーIDが設定されていないと、Botは動作しません !!!
-# 例: TARGET_GUILD_ID = 123456789012345678
-TARGET_GUILD_ID = 1417850283131797506 
-# ====================================================
+# TARGET_GUILD_ID はグローバルコマンド対応のため削除。
+# Botは参加しているすべてのサーバーでコマンドを自動的に同期します。
 
-if TARGET_GUILD_ID == 0:
-    print("FATAL ERROR: TARGET_GUILD_IDが0のままです。正しいサーバーIDに設定してください。")
-    # Bot起動を停止するため、後続の処理でエラーを発生させる
 
 # Botクライアントの定義
 class StatusTrackerBot(commands.Bot):
@@ -52,9 +42,8 @@ class StatusTrackerBot(commands.Bot):
         # ユーザーのステータスデータを保存するコレクションパス
         self.collection_path = f'artifacts/{self.app_id}/public/data/user_status'
         self.config_doc_ref = None
-        self.report_channel_id = None
-        # ターゲットギルドのオブジェクトを定義 (コマンド同期に必要)
-        self.target_guild_object = discord.Object(id=TARGET_GUILD_ID)
+        self.report_channel_id = None # レポートチャンネルIDはサーバーIDではなく、チャンネルIDとして保存
+        # マルチサーバー対応のため、target_guild_objectは不要になりました。
 
     async def _initialize_db_references(self):
         """dbが初期化された後、ドキュメント参照を設定する"""
@@ -108,37 +97,42 @@ class StatusTrackerBot(commands.Bot):
         # 1. データベース設定のロード
         await self._load_config()
 
-        # 2. コマンドの強制同期
+        # 2. コマンドの強制同期 (グローバルコマンドとして同期)
         try:
-            print(f"--- ターゲットサーバー ({TARGET_GUILD_ID}) への強制同期処理開始 ---")
-            await self.tree.sync(guild=self.target_guild_object)
-            print(f"--- ターゲットサーバーへのコマンド同期完了 ---")
+            print("--- グローバルへの強制同期処理開始 (反映に最大1時間かかる場合があります) ---")
+            # 参加している全サーバーに反映されるグローバルコマンドとして同期
+            await self.tree.sync() 
+            print("--- グローバルへのコマンド同期完了 ---")
 
         except Exception as e:
-            print(f"スラッシュコマンド同期中のエラー: {e}")
+            # 403 Forbiddenなどのエラーが出ても、コマンドが既に登録されていれば動作するため、警告レベルに留める
+            print(f"警告: スラッシュコマンド同期中のエラー: {e}")
             
         # 3. 記録漏れを防ぐための初期ステータス記録
         now = datetime.now(tz_jst)
         print("ユーザーの初期ステータスを取得しています...")
-        target_guild = self.get_guild(TARGET_GUILD_ID)
         
-        if target_guild:
-            await target_guild.chunk() # メンバーキャッシュを強制的に取得
-            for member in target_guild.members:
-                # Botはスキップ、既に記録があるユーザーもスキップ
-                if member.bot or member.id in last_status_updates:
-                    continue
-                
-                status_key = str(member.status)
-                last_status_updates[member.id] = (status_key, now)
-        else:
-             print(f"警告: ターゲットサーバーID {TARGET_GUILD_ID} のサーバーが見つかりません。Botがそのサーバーに参加しているか確認してください。")
+        # 参加している全サーバーのメンバーを対象に初期ステータスを記録
+        # 注: 多数のサーバーに参加している場合、この処理に時間がかかることがあります。
+        for guild in self.guilds:
+            try:
+                await guild.chunk() # メンバーキャッシュを強制的に取得
+                for member in guild.members:
+                    # Botはスキップ、既に記録があるユーザーもスキップ
+                    if member.bot or member.id in last_status_updates:
+                        continue
+                    
+                    status_key = str(member.status)
+                    last_status_updates[member.id] = (status_key, now)
+            except discord.Forbidden:
+                print(f"警告: サーバー '{guild.name}' ({guild.id}) でメンバー情報の読み取りが拒否されました。PRESENCE INTENTとSERVER MEMBERS INTENTを確認してください。")
+            except Exception as e:
+                print(f"初期ステータス記録中にエラーが発生しました ({guild.name}): {e}")
 
         print("初期ステータス記録完了。")
 
         # 4. 定期タスクの開始
         if self.report_channel_id is not None:
-            # 初回起動時は、タスクが設定時刻まで実行されないようにする
             if not self.daily_report.is_running():
                 self.daily_report.start()
                 print(f"日次レポートタスクを開始しました。送信先: {self.report_channel_id}")
@@ -150,10 +144,6 @@ class StatusTrackerBot(commands.Bot):
     async def on_presence_update(self, before, after):
         # Bot自身、またはデータベースが未接続の場合はスキップ
         if after.id == self.user.id or db is None:
-            return
-
-        # メンバーがターゲットサーバー内にいるか確認
-        if after.guild.id != TARGET_GUILD_ID:
             return
 
         user_id = after.id
@@ -172,6 +162,11 @@ class StatusTrackerBot(commands.Bot):
         # ステータスが変わっていない場合は処理を終了
         if current_status_key == prev_status_key:
             return
+            
+        # ログ出力の追加 (ユーザーが確認できるため安心につながります)
+        log_time = now.strftime("%Y-%m-%d %H:%M:%S JST")
+        print(f"[{log_time}] {after.display_name} ({after.id}) のステータスが {get_status_emoji(prev_status_key)} から {get_status_emoji(current_status_key)} に変更されました。")
+
 
         duration = (now - prev_time).total_seconds()
         field_name = f'{prev_status_key}_seconds'
@@ -208,48 +203,54 @@ class StatusTrackerBot(commands.Bot):
             print(f"警告: レポートチャンネルID {self.report_channel_id} が無効です。")
             return
 
-        print("--- 日次レポート処理開始 (JST 00:00) ---")
-
-        # ターゲットギルドのみを処理
-        target_guild = self.get_guild(TARGET_GUILD_ID)
-        if target_guild:
-            days = 1 # 昨日1日間のレポート
+        # チャンネルが属するサーバーIDを取得
+        target_guild_id = report_channel.guild.id
+        target_guild = self.get_guild(target_guild_id)
+        
+        if not target_guild:
+            print(f"警告: レポートチャンネル ({self.report_channel_id}) のサーバーが見つかりません。")
+            return
             
-            # 全メンバー（Bot以外）を対象にレポートを作成し、送信
-            for member in target_guild.members:
-                if member.bot:
-                    continue
-                
-                # ユーザーのデータを取得 (昨日1日分)
-                user_data = await get_user_report_data(member, db, self.collection_path, days=days)
-                
-                if not user_data or user_data.get('total', 0) == 0:
-                    continue
+        print(f"--- 日次レポート処理開始 ({target_guild.name}, JST 00:00) ---")
 
-                online_time = user_data.get('online_time_s', 0)
-                offline_time = user_data.get('offline_time_s', 0)
-                total_sec = online_time + offline_time
-                
-                total_formatted = format_time(total_sec)
-                online_formatted = format_time(online_time)
-                
-                embed = discord.Embed(
-                    title=f"📅 {member.display_name} さんの日次レポート",
-                    description=f"集計期間: **昨日（1日間）**\n📊 **合計活動時間: {total_formatted}**",
-                    color=member.color if member.color != discord.Color.default() else discord.Color.blue()
-                )
-                embed.set_thumbnail(url=member.display_avatar.url)
+        days = 1 # 昨日1日間のレポート
+            
+        # 全メンバー（Bot以外）を対象にレポートを作成し、送信
+        for member in target_guild.members:
+            if member.bot:
+                continue
+            
+            # ユーザーのデータを取得 (昨日1日分)
+            user_data = await get_user_report_data(member, db, self.collection_path, days=days)
+            
+            # データが存在しないか、合計時間が0の場合はスキップ
+            if not user_data or user_data.get('total', 0) == 0:
+                continue
 
-                embed.add_field(name="💻 オンライン活動時間", value=online_formatted, inline=True)
-                embed.add_field(name="💤 オフライン時間", value=format_time(offline_time), inline=True)
-                
-                embed.set_footer(text=f"レポート生成時刻: {datetime.now(tz_jst).strftime('%Y/%m/%d %H:%M:%S JST')}")
+            online_time = user_data.get('online_time_s', 0)
+            offline_time = user_data.get('offline_time_s', 0)
+            total_sec = online_time + offline_time
+            
+            total_formatted = format_time(total_sec)
+            online_formatted = format_time(online_time)
+            
+            embed = discord.Embed(
+                title=f"📅 {member.display_name} さんの日次レポート",
+                description=f"集計期間: **昨日（1日間）**\n📊 **合計活動時間: {total_formatted}**",
+                color=member.color if member.color != discord.Color.default() else discord.Color.blue()
+            )
+            embed.set_thumbnail(url=member.display_avatar.url)
 
-                try:
-                    await report_channel.send(embed=embed)
-                    await asyncio.sleep(0.5) # レートリミット回避のための一時停止
-                except Exception as e:
-                    print(f"レポート送信失敗 (ユーザーID: {member.id}): {e}")
+            embed.add_field(name="💻 オンライン活動時間", value=online_formatted, inline=True)
+            embed.add_field(name="💤 オフライン時間", value=format_time(offline_time), inline=True)
+            
+            embed.set_footer(text=f"レポート生成時刻: {datetime.now(tz_jst).strftime('%Y/%m/%d %H:%M:%S JST')}")
+
+            try:
+                await report_channel.send(embed=embed)
+                await asyncio.sleep(0.5) # レートリミット回避のための一時停止
+            except Exception as e:
+                print(f"レポート送信失敗 (ユーザーID: {member.id}): {e}")
 
         print("--- 日次レポート処理完了 ---")
         
@@ -292,6 +293,7 @@ def get_status_emoji(status):
     if status == 'idle': return '🌙 退席中'
     if status == 'dnd': return '🔴 取り込み中'
     if status == 'offline': return '⚫ オフライン'
+    if status == 'invisible': return '⚫ オフライン(ステルス)'
     return status.capitalize()
 
 async def get_user_report_data(member: discord.Member, db, collection_path, days=7):
@@ -305,7 +307,8 @@ async def get_user_report_data(member: discord.Member, db, collection_path, days
 
     data = doc.to_dict()
     now = datetime.now(tz_jst)
-    statuses = ['online', 'idle', 'dnd', 'offline']
+    # invisible も offline と同等に扱うことが多いが、ここでは個別にカウント
+    statuses = ['online', 'idle', 'dnd', 'offline', 'invisible'] 
     
     total_sec = 0
     online_sec = 0
@@ -325,11 +328,10 @@ async def get_user_report_data(member: discord.Member, db, collection_path, days
         
         if status in ['online', 'idle', 'dnd']:
             online_sec += status_total_sec
-        elif status == 'offline':
+        elif status == 'offline' or status == 'invisible':
             offline_sec += status_total_sec
 
     # ユーザーが現在オンラインの場合、現在のステータスを一時的に加算して「現在までの合計」を表示する
-    # ただし、レポートでは通常、前の日までの完了した時間のみを扱う
     # ここでは、レポートの対象期間（過去 days 日間）に記録された時間のみを返します。
     user_data['total'] = total_sec
     user_data['online_time_s'] = online_sec
@@ -383,7 +385,7 @@ async def send_user_report_embed(interaction: discord.Interaction, member: disco
         inline=True
     )
     
-    statuses = ['online', 'idle', 'dnd', 'offline']
+    statuses = ['online', 'idle', 'dnd', 'offline', 'invisible']
     status_field_value = []
     
     for status in statuses:
@@ -457,7 +459,6 @@ def init_firestore():
 # Discord Bot本体の起動関数
 # -----------------
 def run_discord_bot():
-    # gunicorn/Flask環境でBotがメインプロセスでのみ起動されるようにする
     if current_process().name != 'MainProcess':
         print(f"非メインプロセス ({current_process().name}) です。Botは起動しません。")
         return
@@ -469,10 +470,6 @@ def run_discord_bot():
 
     TOKEN = os.getenv("DISCORD_TOKEN")
     
-    if TARGET_GUILD_ID == 0:
-        print("Botの起動を停止します。TARGET_GUILD_IDが設定されていません。")
-        return
-
     # Botに必要な権限（インテント）を設定
     intents = discord.Intents.default()
     # ユーザーのステータスとアクティビティを追跡するために必須
@@ -482,11 +479,11 @@ def run_discord_bot():
 
     bot = StatusTrackerBot(command_prefix='!', intents=intents)
 
-    # 📌 コマンド定義: TARGET_GUILD_IDにのみ適用される
-    guild_id_object = discord.Object(id=TARGET_GUILD_ID)
+    # 📌 コマンド定義: グローバルコマンドとして登録
 
-    @bot.tree.command(name="set_report_channel", description="日次レポートの送信先チャンネルを設定します。", guild=guild_id_object)
+    @bot.tree.command(name="set_report_channel", description="日次レポートの送信先チャンネルを設定します。")
     @app_commands.describe(channel='レポートを送信するテキストチャンネル')
+    @app_commands.default_permissions(manage_channels=True) # チャンネル管理権限を持つユーザーのみ実行可能
     async def set_report_channel_command(interaction: discord.Interaction, channel: discord.TextChannel):
         await interaction.response.defer(ephemeral=True)
         
@@ -497,6 +494,7 @@ def run_discord_bot():
             return
 
         # 設定を保存
+        # Note: Botの設定は全サーバーで共通の場所に保存されます。
         if await bot._save_config(channel_id):
             
             # 定期タスクを再起動して、新しいチャンネル設定を反映させる
@@ -510,11 +508,11 @@ def run_discord_bot():
         else:
             await interaction.followup.send("❌ 設定の保存に失敗しました。", ephemeral=True)
 
-    @bot.tree.command(name="mytime", description="指定した期間の活動時間レポートを表示します。", guild=guild_id_object)
+    @bot.tree.command(name="mytime", description="指定した期間の活動時間レポートを表示します。")
     @app_commands.choices(period=[
         app_commands.Choice(name="1日 (昨日)", value=1),
-        app_commands.Choice(name="3日間", value=3)
-        # より長い期間が必要ならここに追加
+        app_commands.Choice(name="3日間", value=3),
+        app_commands.Choice(name="7日間", value=7)
     ])
     @app_commands.describe(period='集計する期間', member='活動時間を知りたいサーバーメンバー (省略可能)')
     async def mytime_command(interaction: discord.Interaction, period: app_commands.Choice[int], member: discord.Member = None):
@@ -534,7 +532,8 @@ def run_discord_bot():
         # 結果をEmbedで送信
         await send_user_report_embed(interaction, target_member, user_data, days)
     
-    @bot.tree.command(name="send_report_test", description="設定されたチャンネルへテストレポートを送信します。", guild=guild_id_object)
+    @bot.tree.command(name="send_report_test", description="設定されたチャンネルへテストレポートを送信します。")
+    @app_commands.default_permissions(manage_channels=True) # チャンネル管理権限を持つユーザーのみ実行可能
     async def send_report_test_command(interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
