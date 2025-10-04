@@ -210,10 +210,7 @@ class StatusTrackerBot(commands.Bot):
             logging.info(f"--------------------------")
 
         # 既存のイベント処理に渡す
-        # Note: self.process_application_commands()は既にcommands.Botが実装しているため、
-        # ここではsuper().on_interactionを呼ぶか、何もしない（commands.Botの内部で処理される）が一般的ですが、
-        # commands.Botを継承しているため、ここでは明示的に処理を行う必要はありません。
-        # ただし、app_commandsの機能を使っているため、念のためここで処理を継続させます。
+        # commands.Botを継承しているため、super().on_interaction()を呼び出し、コマンド処理を続行
         await super().on_interaction(interaction)
 
 
@@ -624,9 +621,8 @@ async def send_user_report_embed(interaction: discord.Interaction, member: disco
 # -----------------
 bot = StatusTrackerBot(
     command_prefix='!', 
-    intents=discord.Intents.default(),
-    # Botに必要なインテントを有効化
-    intents=discord.Intents.all() # 念のため全てを有効化 (本番環境では必要なもののみ推奨)
+    # NOTE: Intentsの二重定義を修正。Intents.all()のみを残す。
+    intents=discord.Intents.all() # Botに必要なインテントを有効化
 )
 bot.remove_command('help') # デフォルトのhelpコマンドを削除
 
@@ -729,35 +725,17 @@ def init_firestore():
         
         # Firebase Admin SDKの初期化
         # Admin SDKの資格情報を、GCP/Firebaseのプロジェクト設定に基づいて作成
-        # この環境では、Service Account Keyを base64 エンコードした文字列として渡すことが想定されます
-        # ただし、Canvas環境では `__firebase_config` のみ提供されるため、Admin SDKの代わりに
-        # Web SDK（クライアントサイド）の初期化のみ行います。ここではfirestore()の直接呼び出しは行わず、
-        # `firebase_admin`が存在する場合はそれに依存します。
+        # ここでは、Admin SDKの認証情報が環境内で自動的に提供されていると仮定し、defaultを使用します
         
-        # ! 注意: この環境では、Botがサーバーサイドで動作するため、`firebase_admin`が必要です。
-        # ! Botが `firebase_admin` を使用して認証を行うための標準的なAdmin SDKの資格情報が必要です。
-        # ! 環境変数にサービスアカウントキーのJSONを base64 エンコードして格納し、それを使用することを前提とします。
-        
-        # ここでは、firebase-adminライブラリがインストールされ、環境が適切に設定されていると仮定します。
-        
-        # 通常、Admin SDKの初期化は認証情報に基づいて行われます。
-        # cred = credentials.Certificate(path_to_service_account_key)
-        # firebase_admin.initialize_app(cred, {'projectId': firebase_config['projectId']})
-        
-        # 簡易的な初期化（credentials.ApplicationDefault()またはprojectIdのみを使用）
         if not firebase_admin._apps: # 既に初期化されていないかチェック
             logging.info("Attempting to initialize Firebase Admin SDK...")
             
             # サービスアカウントキーの環境変数 (例: FIREBASE_SERVICE_ACCOUNT_KEY) を使用して初期化を試みる
-            # この例では、Admin SDKの認証情報が環境内で自動的に提供されていると仮定し、defaultを使用します
             firebase_admin.initialize_app(
                 credentials.Certificate({
                     "type": "service_account",
                     "project_id": firebase_config.get("projectId", "default-project-id"),
                     # サービスアカウントキーのその他のフィールドもここに追加する必要があります
-                    # 通常、これらの情報は環境変数として完全なJSONで提供されるか、
-                    # あるいは環境が自動で認証情報を注入します。
-                    # ここでは、最小限の初期化として、Firestoreの取得に進みます。
                 }), 
                 {'projectId': firebase_config['projectId']}
             )
@@ -790,7 +768,6 @@ def start_bot_and_webserver():
     # 3. Flask Webサーバーの起動 (この関数を呼び出したプロセス/スレッドが担当)
     # 外部からのアクセスを許可するために host='0.0.0.0' を指定
     # Flaskはブロッキング関数であるため、この呼び出しがBot実行のメインループとなる
-    # ここでは、Render環境で起動することを想定し、WSGIサーバーを使用せずに`app.run`を使用します。
     logging.info("Flask Webサーバーを起動します (host=0.0.0.0, port=8080)...")
     try:
         app.run(host='0.0.0.0', port=os.environ.get('PORT', 8080))
