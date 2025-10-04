@@ -144,6 +144,8 @@ class StatusTrackerBot(commands.Bot):
         # 2. コマンドの強制同期 (グローバルコマンドとして同期)
         try:
             logging.info("--- 🔄 グローバルへの強制同期処理開始 ---")
+            # サーバーの数が多い場合、Botがログインするまで待つ必要があります
+            await asyncio.sleep(5) 
             await self.tree.sync() 
             logging.info("--- ✅ グローバルへのコマンド同期完了 ---")
 
@@ -621,8 +623,8 @@ async def send_user_report_embed(interaction: discord.Interaction, member: disco
 # -----------------
 bot = StatusTrackerBot(
     command_prefix='!', 
-    # NOTE: Intentsの二重定義を修正。Intents.all()のみを残す。
-    intents=discord.Intents.all() # Botに必要なインテントを有効化
+    # Intentsの二重定義は修正済み
+    intents=discord.Intents.all() 
 )
 bot.remove_command('help') # デフォルトのhelpコマンドを削除
 
@@ -698,6 +700,7 @@ def run_bot():
         # Note: run()はブロッキング関数であり、Botが切断されるまで戻らない
         logging.info("Botクライアントを起動しています...")
         logging.info(f"🔑 Discordに接続を試行しています... (Process ID: {os.getpid()})")
+        # ここでDiscordの接続ログが大量に出力されるはず
         bot.run(DISCORD_BOT_TOKEN) 
     except Exception as e:
         # Bot実行中の致命的なエラーを捕捉
@@ -713,7 +716,6 @@ def init_firestore():
     
     # Firestore設定を環境変数からロード
     try:
-        # Canvas環境から提供されるFirebase Configと初期認証トークンをロード
         firebase_config_str = os.getenv("__firebase_config")
         
         if not firebase_config_str:
@@ -723,22 +725,22 @@ def init_firestore():
         firebase_config = json.loads(firebase_config_str)
         logging.debug("✅ __firebase_config環境変数をロードし、JSONとして解析しました。")
         
-        # Firebase Admin SDKの初期化
-        # Admin SDKの資格情報を、GCP/Firebaseのプロジェクト設定に基づいて作成
-        # ここでは、Admin SDKの認証情報が環境内で自動的に提供されていると仮定し、defaultを使用します
-        
         if not firebase_admin._apps: # 既に初期化されていないかチェック
             logging.info("Attempting to initialize Firebase Admin SDK...")
             
-            # サービスアカウントキーの環境変数 (例: FIREBASE_SERVICE_ACCOUNT_KEY) を使用して初期化を試みる
-            firebase_admin.initialize_app(
-                credentials.Certificate({
-                    "type": "service_account",
-                    "project_id": firebase_config.get("projectId", "default-project-id"),
-                    # サービスアカウントキーのその他のフィールドもここに追加する必要があります
-                }), 
-                {'projectId': firebase_config['projectId']}
-            )
+            # サービスアカウントキーは環境変数からJSON文字列として取得することを強く推奨
+            admin_key_json_str = os.getenv("FIREBASE_ADMIN_CREDENTIALS_JSON") 
+
+            if admin_key_json_str:
+                logging.info("Credential JSON found. Initializing Admin SDK with explicit key...")
+                # JSON文字列を解析し、資格情報として使用
+                cred = credentials.Certificate(json.loads(admin_key_json_str))
+                firebase_admin.initialize_app(cred, {'projectId': firebase_config['projectId']})
+            else:
+                # 警告: 外部環境ではこの方法が使えません。GCP/Firebase環境内で実行している場合のみ有効
+                logging.warning("⚠️ 警告: FIREBASE_ADMIN_CREDENTIALS_JSON が未設定です。Admin SDKをデフォルトの資格情報で初期化します。")
+                firebase_admin.initialize_app(None, {'projectId': firebase_config['projectId']})
+            
             logging.info("✅ Firebase Admin SDK initialized successfully.")
         
         # Firestoreインスタンスを取得
