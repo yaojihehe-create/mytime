@@ -186,6 +186,36 @@ class StatusTrackerBot(commands.Bot):
         # 最後の更新時刻を新しいステータスと時刻で更新
         last_status_updates[user_id] = (current_status_key, now)
         
+    async def on_member_join(self, member):
+        # Bot自身または他のBotはスキップ
+        if member.bot:
+            return
+
+        now = datetime.now(tz_jst)
+        status_key = str(member.status)
+        
+        # ログ出力: メンバー参加と初期ステータス
+        log_time = now.strftime("%Y-%m-%d %H:%M:%S JST")
+        print(f"[{log_time}] 🆕 {member.guild.name} にメンバーが参加しました: {member.display_name} ({member.id}) - 初期ステータス: {get_status_emoji(status_key)}")
+        
+        # last_status_updates に初期ステータスを登録
+        # これにより、この時点から時間計測が開始される
+        if member.id not in last_status_updates:
+             last_status_updates[member.id] = (status_key, now)
+
+    async def on_member_remove(self, member):
+        # Bot自身または他のBotはスキップ
+        if member.bot:
+            return
+            
+        now = datetime.now(tz_jst)
+        log_time = now.strftime("%Y-%m-%d %H:%M:%S JST")
+        print(f"[{log_time}] 🚪 {member.guild.name} からメンバーが退出しました: {member.display_name} ({member.id})")
+
+        # last_status_updates から削除（メモリ解放のため）
+        if member.id in last_status_updates:
+            del last_status_updates[member.id]
+        
     # ----------------------------------------------------
     # 日次レポートタスク (毎日 JST 00:00 実行)
     # ----------------------------------------------------
