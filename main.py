@@ -10,7 +10,7 @@ from threading import Thread
 from multiprocessing import current_process
 from datetime import datetime, timedelta, timezone, time 
 import asyncio
-import logging # ログ出力を強化するために追加
+import logging 
 
 # ログ設定: BotのカスタムメッセージとFirebaseログも表示できるように設定
 # formatを指定することで、ログ出力をより詳細にします。
@@ -29,9 +29,7 @@ try:
     import firebase_admin
     from firebase_admin import credentials, firestore
 except ImportError:
-    # 実際にはCanvas環境で実行されるため、このexitは不要だが、コードの整合性のため残す
     logging.warning("警告: 'firebase-admin'ライブラリが見つかりません。Botを実行するにはインストールが必要です。")
-    # exit() # コメントアウト
 
 
 # Flaskのアプリケーションインスタンスを作成（Webサーバーとして機能）
@@ -42,9 +40,6 @@ db = None
 # 直前のユーザーのステータスと、その状態に移行した時刻 (ユーザーID -> (ステータスキー, datetimeオブジェクト))
 last_status_updates = {} 
 tz_jst = timezone(timedelta(hours=9)) # 日本時間 (JST)
-
-# TARGET_GUILD_ID はグローバルコマンド対応のため削除。
-# Botは参加しているすべてのサーバーでコマンドを自動的に同期します。
 
 
 # Botクライアントの定義
@@ -57,7 +52,6 @@ class StatusTrackerBot(commands.Bot):
         self.collection_path = f'artifacts/{self.app_id}/public/data/user_status'
         self.config_doc_ref = None
         self.report_channel_id = None # レポートチャンネルIDはサーバーIDではなく、チャンネルIDとして保存
-        # マルチサーバー対応のため、target_guild_objectは不要になりました。
 
     async def _initialize_db_references(self):
         """dbが初期化された後、ドキュメント参照を設定する"""
@@ -128,7 +122,6 @@ class StatusTrackerBot(commands.Bot):
         logging.info("ユーザーの初期ステータスを取得しています...")
         
         # 参加している全サーバーのメンバーを対象に初期ステータスを記録
-        # 注: 多数のサーバーに参加している場合、この処理に時間がかかることがあります。
         for guild in self.guilds:
             try:
                 await guild.chunk() # メンバーキャッシュを強制的に取得
@@ -178,7 +171,7 @@ class StatusTrackerBot(commands.Bot):
         if current_status_key == prev_status_key:
             return
             
-        # ログ出力の追加 (ユーザーが確認できるため安心につながります)
+        # ステータス変更時のログ出力
         log_time = now.strftime("%Y-%m-%d %H:%M:%S JST")
         logging.info(f"[{log_time}] {after.display_name} ({after.id}) のステータスが {get_status_emoji(prev_status_key)} から {get_status_emoji(current_status_key)} に変更されました。")
 
@@ -192,11 +185,14 @@ class StatusTrackerBot(commands.Bot):
 
         if duration > 0:
             # FirestoreのIncrement機能を利用して、安全に時間を加算
-            await asyncio.to_thread(doc_ref.set, {
-                field_name: firestore.Increment(duration), # ステータスごとの合計時間
-                date_field_name: firestore.Increment(duration), # 日付+ステータスごとの合計時間
-                'last_updated': now
-            }, merge=True) 
+            try:
+                await asyncio.to_thread(doc_ref.set, {
+                    field_name: firestore.Increment(duration), # ステータスごとの合計時間
+                    date_field_name: firestore.Increment(duration), # 日付+ステータスごとの合計時間
+                    'last_updated': now
+                }, merge=True) 
+            except Exception as e:
+                logging.error(f"Firestoreへのステータス時間記録中にエラーが発生しました: {e}")
 
         # 最後の更新時刻を新しいステータスと時刻で更新
         last_status_updates[user_id] = (current_status_key, now)
@@ -214,7 +210,6 @@ class StatusTrackerBot(commands.Bot):
         logging.info(f"[{log_time}] 🆕 {member.guild.name} にメンバーが参加しました: {member.display_name} ({member.id}) - 初期ステータス: {get_status_emoji(status_key)}")
         
         # last_status_updates に初期ステータスを登録
-        # これにより、この時点から時間計測が開始される
         if member.id not in last_status_updates:
              last_status_updates[member.id] = (status_key, now)
 
@@ -344,15 +339,20 @@ def get_status_emoji(status):
 async def get_user_report_data(member: discord.Member, db, collection_path, days=7):
     """Firestoreから指定した日数分の活動データを取得し集計する"""
     doc_ref = db.collection(collection_path).document(str(member.id))
-    # blocking I/O (Firestore get)をasyncio.to_threadで非同期に実行
-    doc = await asyncio.to_thread(doc_ref.get)
+    
+    try:
+        # blocking I/O (Firestore get)をasyncio.to_threadで非同期に実行
+        doc = await asyncio.to_thread(doc_ref.get)
+    except Exception as e:
+        # Firestoreアクセスエラーを捕捉
+        logging.error(f"Firestoreからのデータ取得中にエラーが発生しました (ユーザーID: {member.id}): {e}")
+        return None
 
     if not doc.exists:
         return None
 
     data = doc.to_dict()
     now = datetime.now(tz_jst)
-    # invisible も offline と同等に扱うことが多いが、ここでは個別にカウント
     statuses = ['online', 'idle', 'dnd', 'offline', 'invisible'] 
     
     total_sec = 0
@@ -402,7 +402,7 @@ async def send_user_report_embed(interaction: discord.Interaction, member: disco
 
     total_formatted = format_time(total_sec)
     online_formatted = format_time(online_time)
-    offline_formatted = format_time(offline_formatted)
+    offline_formatted = format_time(offline_time)
     
     embed = discord.Embed(
         title=f"⏳ {member.display_name} さんの活動時間レポート",
@@ -539,7 +539,6 @@ def run_discord_bot():
             return
 
         # 設定を保存
-        # Note: Botの設定は全サーバーで共通の場所に保存されます。
         if await bot._save_config(channel_id):
             
             # 定期タスクを再起動して、新しいチャンネル設定を反映させる
@@ -555,27 +554,35 @@ def run_discord_bot():
 
     @bot.tree.command(name="mytime", description="指定した期間の活動時間レポートを表示します。")
     @app_commands.choices(period=[
-        app_commands.Choice(name="1日 (昨日)", value=1),
+        app_commands.Choice(name="1日 (今日)", value=1),
         app_commands.Choice(name="3日間", value=3),
         app_commands.Choice(name="7日間", value=7)
     ])
     @app_commands.describe(period='集計する期間', member='活動時間を知りたいサーバーメンバー (省略可能)')
     async def mytime_command(interaction: discord.Interaction, period: app_commands.Choice[int], member: discord.Member = None):
+        # 応答が途切れるのを防ぐため、即座に defer する
         await interaction.response.defer()
         
-        if db is None:
-            await interaction.followup.send("❌ データベースが接続されていません。デプロイを確認してください。")
-            return
-            
-        target_member = member if member is not None else interaction.user
+        try:
+            if db is None:
+                await interaction.followup.send("❌ データベースが接続されていません。デプロイを確認してください。")
+                return
+                
+            target_member = member if member is not None else interaction.user
 
-        days = period.value 
-        
-        # ユーザーデータを取得
-        user_data = await get_user_report_data(target_member, db, bot.collection_path, days=days)
-        
-        # 結果をEmbedで送信
-        await send_user_report_embed(interaction, target_member, user_data, days)
+            days = period.value 
+            
+            # ユーザーデータを取得
+            user_data = await get_user_report_data(target_member, db, bot.collection_path, days=days)
+            
+            # 結果をEmbedで送信
+            await send_user_report_embed(interaction, target_member, user_data, days)
+            
+        except Exception as e:
+            logging.error(f"/mytime コマンド処理中に予期せぬエラーが発生しました: {e}")
+            # エラーが発生した場合でも、必ずフォローアップメッセージを送信して「考え中...」を解除する
+            await interaction.followup.send("❌ レポートの生成中にエラーが発生しました。\n詳細は Bot のログを確認してください。", ephemeral=True)
+
     
     @bot.tree.command(name="send_report_test", description="設定されたチャンネルへテストレポートを送信します。")
     @app_commands.default_permissions(manage_channels=True) # チャンネル管理権限を持つユーザーのみ実行可能
@@ -614,30 +621,6 @@ def run_discord_bot():
 
 
     if TOKEN:
-        try:
-            # Botを実行
-            # ロガーを強化した状態で実行することで、接続エラーがあればログに出力される
-            bot.run(TOKEN, log_handler=None) 
-        except Exception as e:
-            logging.critical(f"Discord Bot 起動失敗: {e}")
+        bot.run(TOKEN)
     else:
-        logging.critical("エラー: Botトークンが設定されていません。")
-
-# -----------------
-# Webサーバーのエンドポイント (Botを起動するためのエントリーポイント)
-# -----------------
-@app.route('/')
-def home():
-    if current_process().name == 'MainProcess':
-        if not hasattr(app, 'bot_thread_started'):
-            app.bot_thread_started = True
-            logging.info("Webアクセスを検知。Discord Botの起動を試みます...")
-            
-            # Botの実行はブロッキングなので、別スレッドで実行
-            Thread(target=run_discord_bot).start()
-            
-            return "Discord Bot is initializing... (Please check Discord in 10 seconds)"
-        else:
-            return "Bot is alive!"
-    else:
-        return "Bot worker is alive (Sub-process)"
+        logging.critical("致命的エラー: DISCORD_TOKEN 環境変数が設定されていません。")
